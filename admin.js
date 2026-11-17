@@ -1498,25 +1498,45 @@ function initAdminPortal() {
 
         tbody.querySelectorAll('.approve-utr-btn').forEach((btn) => {
             btn.addEventListener('click', async () => {
-                const wid = btn.getAttribute('data-id');
-                const uname = btn.getAttribute('data-user');
-                const isUp199 = btn.getAttribute('data-upgrade') === '1';
-                const nextStatus = isUp199 ? '✓ Approved & Receipt Generated' : '✓ Approved & Activated';
-                StorageManager.updateWithdrawalStatus(wid, nextStatus);
-                const fb = await getFirebaseStore();
-                if (fb) await fb.adminApproveUtr(wid, uname);
-                showAdminToast(isUp199 ? `✓ ₹199 UTR Verified & Payment Receipt generated for @${uname}` : `✓ UTR Approved & Account Activated for @${uname}`);
+                if (btn.disabled) return;
+                btn.disabled = true;
+                try {
+                    const wid = btn.getAttribute('data-id');
+                    const uname = btn.getAttribute('data-user');
+                    const isUp199 = btn.getAttribute('data-upgrade') === '1';
+                    const targetItem = (latestAdminData?.withdrawals || []).find((x) => x.id === wid) || null;
+                    const nextStatus = isUp199 ? '✓ Approved & Receipt Generated' : '✓ Approved & Activated';
+                    StorageManager.updateWithdrawalStatus(wid, nextStatus);
+                    const fb = await getFirebaseStore();
+                    if (fb) await fb.adminApproveUtr(wid, uname, targetItem);
+                    showAdminToast(isUp199 ? `✓ ₹199 UTR Verified & Payment Receipt generated for @${uname}` : `✓ UTR Approved & Account Activated for @${uname}`);
+                } catch (err) {
+                    console.error('Approve UTR error:', err);
+                    showAdminToast('Error approving UTR. Please retry.', 'error');
+                } finally {
+                    if (btn.isConnected) btn.disabled = false;
+                }
             });
         });
 
         tbody.querySelectorAll('.reject-utr-btn').forEach((btn) => {
             btn.addEventListener('click', async () => {
-                const wid = btn.getAttribute('data-id');
-                const uname = btn.getAttribute('data-user');
-                StorageManager.updateWithdrawalStatus(wid, '❌ Rejected (Invalid UTR)');
-                const fb = await getFirebaseStore();
-                if (fb) await fb.adminRejectUtr(wid, uname);
-                showAdminToast(`UTR marked rejected for @${uname}`);
+                if (btn.disabled) return;
+                btn.disabled = true;
+                try {
+                    const wid = btn.getAttribute('data-id');
+                    const uname = btn.getAttribute('data-user');
+                    const targetItem = (latestAdminData?.withdrawals || []).find((x) => x.id === wid) || null;
+                    StorageManager.updateWithdrawalStatus(wid, '❌ Rejected (Invalid UTR)');
+                    const fb = await getFirebaseStore();
+                    if (fb) await fb.adminRejectUtr(wid, uname, targetItem);
+                    showAdminToast(`UTR marked rejected for @${uname}`);
+                } catch (err) {
+                    console.error('Reject UTR error:', err);
+                    showAdminToast('Error rejecting UTR. Please retry.', 'error');
+                } finally {
+                    if (btn.isConnected) btn.disabled = false;
+                }
             });
         });
     }
@@ -1679,47 +1699,84 @@ function initAdminPortal() {
 
         modalContent.querySelectorAll('.modal-approve-utr').forEach((btn) => {
             btn.addEventListener('click', async () => {
-                const wid = btn.getAttribute('data-id');
-                const targetW = (latestAdminData?.withdrawals || []).find((x) => x.id === wid);
-                const isUp199 = Boolean(targetW && (Number(targetW.amount) === 199 || String(targetW.type || '').includes('199')));
-                StorageManager.updateWithdrawalStatus(wid, isUp199 ? '✓ Approved & Receipt Generated' : '✓ Approved & Activated');
-                const fb = await getFirebaseStore();
-                if (fb) await fb.adminApproveUtr(wid, username);
-                const updatedUser = latestAdminData?.users?.[username] || { ...userObj, activated: true, activationStatus: 'approved' };
-                inspectUserModal(username, updatedUser, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
-                showAdminToast(isUp199 ? `✓ ₹199 UTR Verified & Receipt Issued for @${username}` : `✓ UTR Approved & Panel Started for @${username}`);
+                if (btn.disabled) return;
+                btn.disabled = true;
+                try {
+                    const wid = btn.getAttribute('data-id');
+                    const targetW = (latestAdminData?.withdrawals || []).find((x) => x.id === wid) || null;
+                    const isUp199 = Boolean(targetW && (Number(targetW.amount) === 199 || String(targetW.type || '').includes('199')));
+                    StorageManager.updateWithdrawalStatus(wid, isUp199 ? '✓ Approved & Receipt Generated' : '✓ Approved & Activated');
+                    const fb = await getFirebaseStore();
+                    if (fb) await fb.adminApproveUtr(wid, username, targetW);
+                    const updatedUser = latestAdminData?.users?.[username] || { ...userObj, activated: true, activationStatus: 'approved' };
+                    inspectUserModal(username, updatedUser, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
+                    showAdminToast(isUp199 ? `✓ ₹199 UTR Verified & Receipt Issued for @${username}` : `✓ UTR Approved & Panel Started for @${username}`);
+                } catch (err) {
+                    console.error('Modal approve UTR error:', err);
+                    showAdminToast('Error approving UTR. Please retry.', 'error');
+                } finally {
+                    if (btn.isConnected) btn.disabled = false;
+                }
             });
         });
 
         modalContent.querySelectorAll('.modal-reject-utr').forEach((btn) => {
             btn.addEventListener('click', async () => {
-                const wid = btn.getAttribute('data-id');
-                StorageManager.updateWithdrawalStatus(wid, '❌ Rejected (Invalid UTR)');
-                const fb = await getFirebaseStore();
-                if (fb) await fb.adminRejectUtr(wid, username);
-                const updatedUser = latestAdminData?.users?.[username] || { ...userObj, activated: false, activationStatus: 'rejected' };
-                inspectUserModal(username, updatedUser, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
-                showAdminToast(`✕ Payment Rejected for @${username}`);
+                if (btn.disabled) return;
+                btn.disabled = true;
+                try {
+                    const wid = btn.getAttribute('data-id');
+                    const targetW = (latestAdminData?.withdrawals || []).find((x) => x.id === wid) || null;
+                    StorageManager.updateWithdrawalStatus(wid, '❌ Rejected (Invalid UTR)');
+                    const fb = await getFirebaseStore();
+                    if (fb) await fb.adminRejectUtr(wid, username, targetW);
+                    const updatedUser = latestAdminData?.users?.[username] || { ...userObj, activated: false, activationStatus: 'rejected' };
+                    inspectUserModal(username, updatedUser, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
+                    showAdminToast(`✕ Payment Rejected for @${username}`);
+                } catch (err) {
+                    console.error('Modal reject UTR error:', err);
+                    showAdminToast('Error rejecting UTR. Please retry.', 'error');
+                } finally {
+                    if (btn.isConnected) btn.disabled = false;
+                }
             });
         });
 
         const approvePanelBtn = document.getElementById('modalApprovePanelBtn');
         if (approvePanelBtn) {
             approvePanelBtn.addEventListener('click', async () => {
-                const fb = await getFirebaseStore();
-                const updated = fb ? await fb.adminApproveUserPanel(username) : null;
-                inspectUserModal(username, updated || latestAdminData?.users?.[username] || userObj, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
-                showAdminToast(`✓ Panel Approved & Transactions Started for @${username}`);
+                if (approvePanelBtn.disabled) return;
+                approvePanelBtn.disabled = true;
+                try {
+                    const fb = await getFirebaseStore();
+                    const updated = fb ? await fb.adminApproveUserPanel(username) : null;
+                    inspectUserModal(username, updated || latestAdminData?.users?.[username] || userObj, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
+                    showAdminToast(`✓ Panel Approved & Transactions Started for @${username}`);
+                } catch (err) {
+                    console.error('Approve user panel error:', err);
+                    showAdminToast('Error approving panel. Please retry.', 'error');
+                } finally {
+                    if (approvePanelBtn.isConnected) approvePanelBtn.disabled = false;
+                }
             });
         }
 
         const rejectPaymentBtn = document.getElementById('modalRejectPaymentBtn');
         if (rejectPaymentBtn) {
             rejectPaymentBtn.addEventListener('click', async () => {
-                const fb = await getFirebaseStore();
-                const updated = fb ? await fb.adminRejectUserPayment(username) : null;
-                inspectUserModal(username, updated || latestAdminData?.users?.[username] || userObj, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
-                showAdminToast(`✕ Payment Rejected — User notified to pay charges for @${username}`);
+                if (rejectPaymentBtn.disabled) return;
+                rejectPaymentBtn.disabled = true;
+                try {
+                    const fb = await getFirebaseStore();
+                    const updated = fb ? await fb.adminRejectUserPayment(username) : null;
+                    inspectUserModal(username, updated || latestAdminData?.users?.[username] || userObj, latestAdminData?.withdrawals, latestAdminData?.activityLogs);
+                    showAdminToast(`✕ Payment Rejected — User notified to pay charges for @${username}`);
+                } catch (err) {
+                    console.error('Reject payment error:', err);
+                    showAdminToast('Error rejecting payment. Please retry.', 'error');
+                } finally {
+                    if (rejectPaymentBtn.isConnected) rejectPaymentBtn.disabled = false;
+                }
             });
         }
 

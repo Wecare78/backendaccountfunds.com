@@ -266,8 +266,34 @@ async function isExpressBackendAvailable() {
   return backendDetectPromise;
 }
 
+let sseSource = null;
+const sseListeners = new Set();
+
+function ensureServerSseConnected() {
+  if (typeof window === 'undefined' || typeof EventSource === 'undefined' || sseSource) return;
+  try {
+    sseSource = new EventSource('/api/events');
+    sseSource.addEventListener('sync', (evt) => {
+      let detail = { type: 'sync' };
+      try {
+        detail = evt && evt.data ? JSON.parse(evt.data) : detail;
+      } catch {}
+      sseListeners.forEach((fn) => {
+        try {
+          fn(detail);
+        } catch {}
+      });
+    });
+    sseSource.onerror = () => {
+      // Browser EventSource reconnects automatically using server retry interval
+    };
+  } catch {}
+}
+
 if (typeof window !== 'undefined' && !isStaticHostOrigin()) {
-  void isExpressBackendAvailable();
+  void isExpressBackendAvailable().then((ok) => {
+    if (ok) ensureServerSseConnected();
+  });
 }
 
 function getStoredAdminToken() {
@@ -281,6 +307,7 @@ function getStoredAdminToken() {
 async function apiJson(url, options = {}) {
   const hasBackend = await isExpressBackendAvailable();
   if (!hasBackend) return { ok: false, status: 0, data: null };
+  ensureServerSseConnected();
   try {
     const res = await fetch(url, {
       ...options,
@@ -341,16 +368,15 @@ async function getFirestoreContext() {
           ? fsMod.getFirestore(app, fbCfg.firestoreDatabaseId)
           : fsMod.getFirestore(app);
 
-        // Validate connection to Firestore on startup per SDK guidelines
-        try {
-          await fsMod.getDocFromServer(fsMod.doc(db, 'test', 'connection'));
-        } catch (err) {
+        firestoreContext = { app, db, fs: fsMod };
+
+        // Validate connection to Firestore asynchronously so listeners/writes start immediately
+        void fsMod.getDocFromServer(fsMod.doc(db, 'test', 'connection')).catch((err) => {
           if (err instanceof Error && err.message.includes('the client is offline')) {
             console.error('Please check your Firebase configuration.');
           }
-        }
+        });
 
-        firestoreContext = { app, db, fs: fsMod };
         return firestoreContext;
       } catch (err) {
         console.warn('Firestore SDK init deferred:', err?.message || err);
@@ -463,7 +489,78 @@ const ALLOWED_USER_UPDATE_KEYS = new Set([
   'mobile',
 ]);
 
-async function fsFindUser(identifier) {
+function sanitizeUtrEntry(raw, fallbackId = '', overrideStatus = null) {
+  const id = sanitizeSafeId(String(raw?.id || fallbackId || ''), 'WTH');
+  const unameRaw = String(raw?.username || 'user').trim().slice(0, 64) || 'user';
+  return {
+    id,
+    username: unameRaw,
+    type: String(raw?.type || 'UTR Submission').slice(0, 100),
+    amount: safeNum(raw?.amount),
+    utr: String(raw?.utr || '').slice(0, 64),
+    tokenNumber: String(raw?.tokenNumber || raw?.utr || '').slice(0, 64),
+    status: String(overrideStatus || raw?.status || 'Pending Admin Approval').slice(0, 80),
+    bank: String(raw?.bank || '').slice(0, 120),
+    ifsc: String(raw?.ifsc || '').slice(0, 20),
+    accNumber: String(raw?.accNumber || '').slice(0, 32),
+    accountHolder: String(raw?.accountHolder || '').slice(0, 120),
+    contact: String(raw?.contact || '').slice(0, 20),
+    timestamp: String(raw?.timestamp || new Date().toISOString()).slice(0, 64),
+  };
+}
+
+function sanitizeActivityEntry(entry) {
+  if (!entry || !entry.id || !entry.username) return null;
+  return {
+    id: sanitizeSafeId(String(entry.id), 'ACT'),
+    username: String(entry.username).trim().slice(0, 64) || 'user',
+    mobile: String(entry.mobile || '').slice(0, 20),
+    actionType: String(entry.actionType || 'event').slice(0, 48),
+    category: String(entry.category || 'general').slice(0, 48),
+    details: String(entry.details || '-').slice(0, 490),
+    status: String(entry.status || 'success').slice(0, 32),
+    timestamp: String(entry.timestamp || new Date().toISOString()).slice(0, 64),
+  };
+}
+
+function sanitizeUserPatch(patch) {
+  const clean = {};
+  if (!patch || typeof patch !== 'object') return clean;
+  Object.entries(patch).forEach(([kName, v]) => {
+    if (!ALLOWED_USER_UPDATE_KEYS.has(kName) || v === undefined) return;
+    if (kName === 'accountDetails') {
+      clean.accountDetails = v ? sanitizeAccountDetails(v) : null;
+    } else if (kName === 'autodebitDetails') {
+      clean.autodebitDetails = v ? sanitizeAutodebitDetails(v) : null;
+    } else if (kName === 'balance' || kName === 'commission') {
+      clean[kName] = safeNum(v);
+    } else if (kName === 'loginCount') {
+      clean.loginCount = Math.floor(safeNum(v));
+    } else if (kName === 'loginHistory') {
+      clean.loginHistory = Array.isArray(v) ? v.slice(-50).map((t) => String(t).slice(0, 64)) : [];
+    } else if (kName === 'transactions') {
+      clean.transactions = Array.isArray(v) ? v.slice(-200) : [];
+    } else if (kName === 'activated') {
+      clean.activated = Boolean(v);
+    } else if (kName === 'activationStatus') {
+      const allowed = ['not_submitted', 'pending_approval', 'approved', 'rejected'];
+      if (allowed.includes(v)) clean.activationStatus = v;
+    } else if (kName === 'rejectionMessage') {
+      clean.rejectionMessage = String(v || '').slice(0, 300);
+    } else if (kName === 'activationCode') {
+      clean.activationCode = String(v || '').slice(0, 32);
+    } else if (kName === 'mobile') {
+      clean.mobile = String(v || '').slice(0, 15);
+    } else if (kName === 'lastLoginAt') {
+      clean.lastLoginAt = String(v || '').slice(0, 64);
+    } else {
+      clean[kName] = v;
+    }
+  });
+  return clean;
+}
+
+async function fsFindUser(identifier, allowFullScan = true) {
   const ctx = await getFirestoreContext();
   if (!ctx) return null;
   const { db, fs } = ctx;
@@ -482,17 +579,21 @@ async function fsFindUser(identifier) {
   }
 
   const digits = cleanId.replace(/\D/g, '').slice(-10);
+  const queries = [fs.query(fs.collection(db, COLLECTIONS.users), fs.where('username', '==', cleanId))];
   if (digits.length === 10) {
-    try {
-      const q = fs.query(fs.collection(db, COLLECTIONS.users), fs.where('mobile', '==', digits));
-      const qs = await fs.getDocs(q);
-      if (!qs.empty) {
-        return qs.docs[0].data();
-      }
-    } catch (err) {
-      handleFirestoreError(err, OperationType.LIST, COLLECTIONS.users);
-    }
+    queries.push(fs.query(fs.collection(db, COLLECTIONS.users), fs.where('mobile', '==', digits)));
   }
+
+  try {
+    const results = await Promise.all(queries.map((q) => fs.getDocs(q)));
+    for (const qs of results) {
+      if (!qs.empty) return qs.docs[0].data();
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, COLLECTIONS.users);
+  }
+
+  if (!allowFullScan) return null;
 
   try {
     const allSnap = await fs.getDocs(fs.collection(db, COLLECTIONS.users));
@@ -512,38 +613,46 @@ async function fsFindUser(identifier) {
 
 async function fsUpsertUser(uname, patch) {
   const ctx = await getFirestoreContext();
-  if (!ctx || !uname || uname === 'demo') return false;
+  const cleanUname = String(uname || '').trim();
+  if (!ctx || !cleanUname || cleanUname === 'demo') return false;
   const { db, fs } = ctx;
-  const docId = toDocId(uname);
-  const docRef = fs.doc(db, COLLECTIONS.users, docId);
-  const path = `${COLLECTIONS.users}/${docId}`;
+  const docId = toDocId(cleanUname);
+  let targetRef = fs.doc(db, COLLECTIONS.users, docId);
+  let path = `${COLLECTIONS.users}/${docId}`;
 
   let existsSnap = null;
   try {
-    existsSnap = await fs.getDoc(docRef);
+    existsSnap = await fs.getDoc(targetRef);
   } catch (err) {
     handleFirestoreError(err, OperationType.GET, path);
   }
 
-  if (existsSnap && existsSnap.exists()) {
-    const filteredPatch = {};
-    Object.entries(patch || {}).forEach(([kName, v]) => {
-      if (ALLOWED_USER_UPDATE_KEYS.has(kName) && v !== undefined) {
-        filteredPatch[kName] = v;
+  if (!existsSnap || !existsSnap.exists()) {
+    try {
+      const q = fs.query(fs.collection(db, COLLECTIONS.users), fs.where('username', '==', cleanUname));
+      const qs = await fs.getDocs(q);
+      if (!qs.empty) {
+        existsSnap = qs.docs[0];
+        targetRef = existsSnap.ref;
+        path = `${COLLECTIONS.users}/${existsSnap.id}`;
       }
-    });
+    } catch {}
+  }
+
+  if (existsSnap && existsSnap.exists()) {
+    const filteredPatch = sanitizeUserPatch(patch);
     if (Object.keys(filteredPatch).length === 0) return true;
     try {
-      await fs.updateDoc(docRef, filteredPatch);
+      await fs.updateDoc(targetRef, filteredPatch);
       return true;
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, path);
     }
   } else {
-    const local = findLocalUser(uname) || { username: uname, docId };
+    const local = findLocalUser(cleanUname) || { username: cleanUname, docId };
     const fullDoc = buildValidFirestoreUser(local, patch);
     try {
-      await fs.setDoc(docRef, fullDoc);
+      await fs.setDoc(targetRef, fullDoc);
       return true;
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, path);
@@ -554,11 +663,12 @@ async function fsUpsertUser(uname, patch) {
 
 async function fsCreateActivity(entry) {
   const ctx = await getFirestoreContext();
-  if (!ctx || !entry || !entry.id || !entry.username || entry.username === 'demo') return false;
+  const safeEntry = sanitizeActivityEntry(entry);
+  if (!ctx || !safeEntry || safeEntry.username === 'demo') return false;
   const { db, fs } = ctx;
-  const path = `${COLLECTIONS.activityLogs}/${entry.id}`;
+  const path = `${COLLECTIONS.activityLogs}/${safeEntry.id}`;
   try {
-    await fs.setDoc(fs.doc(db, COLLECTIONS.activityLogs, entry.id), entry);
+    await fs.setDoc(fs.doc(db, COLLECTIONS.activityLogs, safeEntry.id), safeEntry);
     return true;
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, path);
@@ -570,9 +680,18 @@ async function fsCreateSms(smsEntry) {
   const ctx = await getFirestoreContext();
   if (!ctx || !smsEntry || !smsEntry.id || !smsEntry.username) return false;
   const { db, fs } = ctx;
-  const path = `${COLLECTIONS.smsLogs}/${smsEntry.id}`;
+  const safeSms = {
+    id: sanitizeSafeId(String(smsEntry.id), 'SMS'),
+    username: String(smsEntry.username).trim().slice(0, 64) || 'user',
+    bankName: String(smsEntry.bankName || 'Linked Bank').slice(0, 120),
+    senderCode: String(smsEntry.senderCode || 'BANK-SMS').slice(0, 32),
+    amount: safeNum(smsEntry.amount),
+    accountNumber: String(smsEntry.accountNumber || '').slice(0, 32),
+    timestamp: String(smsEntry.timestamp || new Date().toISOString()).slice(0, 64),
+  };
+  const path = `${COLLECTIONS.smsLogs}/${safeSms.id}`;
   try {
-    await fs.setDoc(fs.doc(db, COLLECTIONS.smsLogs, smsEntry.id), smsEntry);
+    await fs.setDoc(fs.doc(db, COLLECTIONS.smsLogs, safeSms.id), safeSms);
     return true;
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, path);
@@ -662,6 +781,7 @@ async function pullAllFromRtdbIfConfigured() {
 }
 
 const localOtps = new Map();
+const recentlyDeletedUsers = new Map();
 let activeTargetMobile = '';
 
 // --------------------------------------------
@@ -894,17 +1014,17 @@ const store = {
       return { success: false, message: 'This mobile number is already registered! Please login.' };
     }
 
-    // Check Cloud Firestore uniqueness before creating
+    // Fast parallel Cloud Firestore uniqueness check
     try {
-      const existingByName = await fsFindUser(uname);
+      const [existingByName, existingByMobile] = await Promise.all([
+        fsFindUser(uname, false),
+        cleanMobile ? fsFindUser(cleanMobile, false) : Promise.resolve(null),
+      ]);
       if (existingByName) {
         return { success: false, message: 'Username already taken! Please choose another.' };
       }
-      if (cleanMobile) {
-        const existingByMobile = await fsFindUser(cleanMobile);
-        if (existingByMobile) {
-          return { success: false, message: 'This mobile number is already registered! Please login.' };
-        }
+      if (existingByMobile) {
+        return { success: false, message: 'This mobile number is already registered! Please login.' };
       }
     } catch {}
 
@@ -934,7 +1054,8 @@ const store = {
       transactions: [],
     });
 
-    if (await isExpressBackendAvailable()) {
+    const hasExpress = await isExpressBackendAvailable();
+    if (hasExpress) {
       const res = await apiJson('/api/users/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -944,23 +1065,7 @@ const store = {
           email: newUser.email,
         }),
       });
-      if (res.ok && res.data?.success) {
-        const finalUser = buildValidFirestoreUser(res.data.user || newUser);
-        users[uname] = finalUser;
-        saveLocalUsersMap(users);
-        const act = pushLocalActivity(uname, 'register', `New user registered with OTP verified mobile +91 ${cleanMobile}`, 'registration', 'success', cleanMobile);
-        try {
-          await fsUpsertUser(uname, finalDocOverride(finalUser));
-          if (act) await fsCreateActivity(act);
-        } catch {}
-        broadcastSyncEvent('register');
-        return {
-          success: true,
-          message: res.data.message || 'Registration successful! Please login with your mobile number or username and password.',
-          user: finalUser,
-        };
-      }
-      if (res.data?.message) {
+      if (res.data && !res.ok && res.data.message) {
         return { success: false, message: res.data.message };
       }
     }
@@ -968,30 +1073,26 @@ const store = {
     users[uname] = newUser;
     saveLocalUsersMap(users);
     const act = pushLocalActivity(uname, 'register', `New user registered with OTP verified mobile +91 ${cleanMobile}`, 'registration', 'success', cleanMobile);
-
-    // Sync to Cloud Firestore directly
-    const fsCtx = await getFirestoreContext();
-    if (fsCtx) {
-      const path = `${COLLECTIONS.users}/${docId}`;
-      try {
-        await fsCtx.fs.setDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.users, docId), newUser);
-      } catch (err) {
-        handleFirestoreError(err, OperationType.CREATE, path);
-      }
-      if (act) {
-        try {
-          await fsCreateActivity(act);
-        } catch {}
-      }
-    }
-
-    const cfg = getActiveCloudConfig();
-    if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(docId)}`, 'PUT', newUser);
-      if (act) await rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act);
-    }
-
     broadcastSyncEvent('register');
+
+    const fsCtx = await getFirestoreContext();
+    const cfg = getActiveCloudConfig();
+    const tasks = [];
+    if (fsCtx) {
+      tasks.push(
+        fsCtx.fs.setDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.users, docId), newUser).catch((err) => {
+          console.error('Firestore registerUser error:', err);
+        })
+      );
+      if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
+    }
+    if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(docId)}`, 'PUT', newUser));
+      if (act) tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
+    }
+    await Promise.allSettled(tasks);
+    broadcastSyncEvent('register');
+
     return {
       success: true,
       message: 'Registration successful! Please login with your mobile number or username and password.',
@@ -1006,21 +1107,19 @@ const store = {
     if (await isExpressBackendAvailable()) {
       const res = await apiJson('/api/users/login', {
         method: 'POST',
-        body: JSON.stringify({ identifier, password }),
+        body: JSON.stringify({ identifier, password, localFallbackUser: findLocalUser(identifier) || undefined }),
       });
       if (res.ok && res.data?.success && res.data.user) {
         const users = getLocalUsersMap();
         users[res.data.user.username] = res.data.user;
         saveLocalUsersMap(users);
         syncUserStatsToLocalKeys(res.data.user);
-        try {
-          await fsUpsertUser(res.data.user.username, {
-            lastLoginAt: res.data.user.lastLoginAt,
-            loginCount: res.data.user.loginCount,
-            loginHistory: res.data.user.loginHistory,
-          });
-        } catch {}
         broadcastSyncEvent('login');
+        void fsUpsertUser(res.data.user.username, {
+          lastLoginAt: res.data.user.lastLoginAt,
+          loginCount: res.data.user.loginCount,
+          loginHistory: res.data.user.loginHistory,
+        }).catch(() => {});
         return {
           success: true,
           username: res.data.username || res.data.user.username,
@@ -1030,7 +1129,7 @@ const store = {
       }
       if (res.status === 401 || res.status === 404) {
         const localHit = findLocalUser(identifier);
-        const fsHit = localHit || (await fsFindUser(identifier).catch(() => null));
+        const fsHit = localHit || (await fsFindUser(identifier, true).catch(() => null));
         if (!fsHit) {
           return { success: false, message: res.data?.message || 'Account not found or incorrect password!' };
         }
@@ -1044,7 +1143,7 @@ const store = {
 
     let userRecord = null;
     try {
-      const remoteFsUser = await fsFindUser(identifier);
+      const remoteFsUser = await fsFindUser(identifier, true);
       if (remoteFsUser) {
         userRecord = remoteFsUser;
         const users = getLocalUsersMap();
@@ -1084,26 +1183,28 @@ const store = {
     saveLocalUsersMap(users);
     syncUserStatsToLocalKeys(updatedUser);
     const act = pushLocalActivity(userRecord.username, 'login', 'User logged in successfully', 'auth', 'success', userRecord.mobile);
-
-    try {
-      await fsUpsertUser(userRecord.username, {
-        lastLoginAt: now,
-        loginCount: nextCount,
-        loginHistory: nextHistory,
-      });
-      if (act) await fsCreateActivity(act);
-    } catch {}
-
-    if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(userRecord.username))}`, 'PATCH', {
-        lastLoginAt: now,
-        loginCount: nextCount,
-        loginHistory: nextHistory,
-      });
-      if (act) await rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act);
-    }
-
     broadcastSyncEvent('login');
+
+    const syncTasks = [
+      fsUpsertUser(userRecord.username, {
+        lastLoginAt: now,
+        loginCount: nextCount,
+        loginHistory: nextHistory,
+      }).catch(() => {}),
+    ];
+    if (act) syncTasks.push(fsCreateActivity(act).catch(() => {}));
+    if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+      syncTasks.push(
+        rtdbFetch(`users/${encodeURIComponent(toDocId(userRecord.username))}`, 'PATCH', {
+          lastLoginAt: now,
+          loginCount: nextCount,
+          loginHistory: nextHistory,
+        })
+      );
+      if (act) syncTasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
+    }
+    await Promise.allSettled(syncTasks);
+
     return {
       success: true,
       username: updatedUser.username,
@@ -1115,7 +1216,7 @@ const store = {
   async getUserProfile(u) {
     if (!u || u === 'demo') return null;
     try {
-      const fsUser = await fsFindUser(u);
+      const fsUser = await fsFindUser(u, false);
       if (fsUser) {
         const users = getLocalUsersMap();
         users[fsUser.username || u] = fsUser;
@@ -1149,65 +1250,154 @@ const store = {
     let stopped = false;
     let pollTimer = null;
     let unsubFirestore = null;
+    let sseHandler = null;
+    let fsUserState = null;
+    let expressUserState = null;
+
+    const mergeAndEmitUser = () => {
+      if (stopped) return;
+      const localUser = findLocalUser(u);
+      const candidates = [localUser, expressUserState, fsUserState].filter(Boolean);
+      if (candidates.length === 0) return;
+
+      // Combine cleanly prioritizing latest authoritative status & non-null details
+      let merged = { ...candidates[0] };
+      for (const c of candidates.slice(1)) {
+        const prevTxns = Array.isArray(merged.transactions) ? merged.transactions : [];
+        const nextTxns = Array.isArray(c.transactions) ? c.transactions : [];
+        merged = {
+          ...merged,
+          ...c,
+          accountDetails: c.accountDetails || merged.accountDetails || null,
+          autodebitDetails: c.autodebitDetails || merged.autodebitDetails || null,
+          transactions: nextTxns.length >= prevTxns.length ? nextTxns : prevTxns,
+          balance: Math.max(safeNum(merged.balance), safeNum(c.balance)) === 0 && (c.balance === 0 || merged.balance === 0)
+            ? safeNum(c.balance)
+            : (nextTxns.length >= prevTxns.length ? safeNum(c.balance) : safeNum(merged.balance)),
+          commission: nextTxns.length >= prevTxns.length ? safeNum(c.commission) : safeNum(merged.commission),
+        };
+      }
+
+      // If Firestore & Express disagree only due to transport lag, pick highest priority state cleanly:
+      // latest remote (fsUserState or expressUserState) wins when both exist
+      const primaryRemote = fsUserState || expressUserState;
+      if (fsUserState && expressUserState) {
+        // If either just approved while the other is still pending_approval, reflect approved immediately
+        if (
+          (fsUserState.activationStatus === 'approved' && expressUserState.activationStatus === 'pending_approval') ||
+          (expressUserState.activationStatus === 'approved' && fsUserState.activationStatus === 'pending_approval')
+        ) {
+          merged.activated = true;
+          merged.activationStatus = 'approved';
+          merged.rejectionMessage = '';
+        } else if (
+          (fsUserState.activationStatus === 'rejected' && expressUserState.activationStatus === 'pending_approval') ||
+          (expressUserState.activationStatus === 'rejected' && fsUserState.activationStatus === 'pending_approval')
+        ) {
+          merged.activated = false;
+          merged.activationStatus = 'rejected';
+          merged.rejectionMessage = fsUserState.rejectionMessage || expressUserState.rejectionMessage || '';
+        } else {
+          merged.activated = Boolean(primaryRemote.activated);
+          merged.activationStatus = primaryRemote.activationStatus || (primaryRemote.activated ? 'approved' : 'not_submitted');
+          merged.rejectionMessage = primaryRemote.rejectionMessage || '';
+        }
+      } else if (primaryRemote) {
+        merged.activated = Boolean(primaryRemote.activated);
+        merged.activationStatus = primaryRemote.activationStatus || (primaryRemote.activated ? 'approved' : 'not_submitted');
+        merged.rejectionMessage = primaryRemote.rejectionMessage || '';
+      }
+
+      const users = getLocalUsersMap();
+      users[merged.username || u] = merged;
+      saveLocalUsersMap(users);
+      cb(merged);
+    };
 
     const emitLocal = () => {
       if (stopped) return;
       const user = findLocalUser(u);
-      if (user) cb(user);
+      if (user) {
+        if (!fsUserState && !expressUserState) {
+          cb(user);
+        } else {
+          mergeAndEmitUser();
+        }
+      }
     };
 
     localListeners.add(emitLocal);
     emitLocal();
 
     const setupRemote = async () => {
-      const ctx = await getFirestoreContext();
+      const [ctx, hasBackend] = await Promise.all([getFirestoreContext(), isExpressBackendAvailable()]);
+      const cfg = getActiveCloudConfig();
+
       if (!stopped && ctx && u && u !== 'demo') {
         const docId = toDocId(u);
         const path = `${COLLECTIONS.users}/${docId}`;
         unsubFirestore = ctx.fs.onSnapshot(
           ctx.fs.doc(ctx.db, COLLECTIONS.users, docId),
           (snap) => {
-            if (stopped || !snap.exists()) return;
-            const userData = snap.data();
-            const users = getLocalUsersMap();
-            users[userData.username || u] = userData;
-            saveLocalUsersMap(users);
-            cb(userData);
+            if (stopped) return;
+            if (snap.exists()) {
+              fsUserState = snap.data();
+              mergeAndEmitUser();
+            } else {
+              // Fallback listener by username query if stored under another docId
+              void ctx.fs
+                .getDocs(ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.users), ctx.fs.where('username', '==', u)))
+                .then((qs) => {
+                  if (!stopped && !qs.empty) {
+                    fsUserState = qs.docs[0].data();
+                    mergeAndEmitUser();
+                  }
+                })
+                .catch(() => {});
+            }
           },
           (error) => {
             handleFirestoreError(error, OperationType.GET, path);
           }
         );
-        return;
       }
 
-      const hasBackend = await isExpressBackendAvailable();
-      const cfg = getActiveCloudConfig();
-      if (!hasBackend && cfg.mode !== 'rtdb') return;
-
-      const tick = async () => {
-        if (stopped) return;
-        if (hasBackend) {
-          const res = await apiJson(`/api/users/profile/${encodeURIComponent(u)}`);
-          if (!stopped && res.ok && res.data?.success && res.data.user) {
-            const users = getLocalUsersMap();
-            users[res.data.user.username] = res.data.user;
-            saveLocalUsersMap(users);
-            cb(res.data.user);
-          }
-        } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-          const r = await rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'GET');
-          if (!stopped && r.ok && r.data) {
-            const users = getLocalUsersMap();
-            users[r.data.username || u] = r.data;
-            saveLocalUsersMap(users);
-            cb(r.data);
-          }
+      const fetchExpressProfile = async () => {
+        if (stopped || !hasBackend || !u || u === 'demo') return;
+        const res = await apiJson(`/api/users/profile/${encodeURIComponent(u)}`);
+        if (!stopped && res.ok && res.data?.success && res.data.user) {
+          expressUserState = res.data.user;
+          mergeAndEmitUser();
         }
       };
 
-      void tick();
-      pollTimer = setInterval(() => void tick(), 2500);
+      if (hasBackend) {
+        ensureServerSseConnected();
+        void fetchExpressProfile();
+        sseHandler = (detail) => {
+          if (!detail?.username || detail.username === u) {
+            void fetchExpressProfile();
+          }
+        };
+        sseListeners.add(sseHandler);
+      }
+
+      if (!ctx && (hasBackend || (cfg.mode === 'rtdb' && cfg.rtdbUrl))) {
+        const tick = async () => {
+          if (stopped) return;
+          if (hasBackend) {
+            await fetchExpressProfile();
+          } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+            const r = await rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'GET');
+            if (!stopped && r.ok && r.data) {
+              expressUserState = r.data;
+              mergeAndEmitUser();
+            }
+          }
+        };
+        void tick();
+        pollTimer = setInterval(() => void tick(), 2000);
+      }
     };
 
     void setupRemote();
@@ -1215,6 +1405,7 @@ const store = {
     return () => {
       stopped = true;
       localListeners.delete(emitLocal);
+      if (sseHandler) sseListeners.delete(sseHandler);
       if (typeof unsubFirestore === 'function') unsubFirestore();
       if (pollTimer) clearInterval(pollTimer);
     };
@@ -1224,63 +1415,103 @@ const store = {
     let stopped = false;
     let pollTimer = null;
     let unsubFirestore = null;
+    let sseHandler = null;
+    let fsUtrs = null;
+    let expressUtrs = null;
+
+    const statusScore = (s) => {
+      const str = String(s || '').toLowerCase();
+      if (str.includes('approved') || str.includes('receipt') || str.includes('activated')) return 3;
+      if (str.includes('rejected')) return 2;
+      return 1;
+    };
+
+    const mergeAndEmitUtrs = () => {
+      if (stopped) return;
+      const byId = new Map();
+      const applyList = (arr) => {
+        (Array.isArray(arr) ? arr : []).forEach((w) => {
+          if (!w || !w.id) return;
+          const prev = byId.get(w.id);
+          if (!prev || statusScore(w.status) >= statusScore(prev.status)) {
+            byId.set(w.id, { ...(prev || {}), ...w });
+          }
+        });
+      };
+      applyList(getLocalUtrs().filter((w) => w && w.username === u));
+      applyList(expressUtrs);
+      applyList(fsUtrs);
+
+      const items = Array.from(byId.values());
+      items.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
+      const localOthers = getLocalUtrs().filter((w) => w && w.username !== u);
+      saveLocalUtrs([...items, ...localOthers]);
+      cb(items);
+    };
 
     const emitLocal = () => {
       if (stopped) return;
-      const items = getLocalUtrs().filter((w) => w && w.username === u);
-      items.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
-      cb(items);
+      mergeAndEmitUtrs();
     };
 
     localListeners.add(emitLocal);
     emitLocal();
 
     const setupRemote = async () => {
-      const ctx = await getFirestoreContext();
+      const [ctx, hasBackend] = await Promise.all([getFirestoreContext(), isExpressBackendAvailable()]);
+      const cfg = getActiveCloudConfig();
+
       if (!stopped && ctx && u && u !== 'demo') {
         const q = ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.utrs), ctx.fs.where('username', '==', u));
         unsubFirestore = ctx.fs.onSnapshot(
           q,
           (qs) => {
             if (stopped) return;
-            const items = qs.docs.map((d) => d.data()).filter(Boolean);
-            items.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
-            const localOthers = getLocalUtrs().filter((w) => w && w.username !== u);
-            saveLocalUtrs([...items, ...localOthers]);
-            cb(items);
+            fsUtrs = qs.docs.map((d) => d.data()).filter(Boolean);
+            mergeAndEmitUtrs();
           },
           (error) => {
             handleFirestoreError(error, OperationType.LIST, COLLECTIONS.utrs);
           }
         );
-        return;
       }
 
-      const hasBackend = await isExpressBackendAvailable();
-      const cfg = getActiveCloudConfig();
-      if (!hasBackend && cfg.mode !== 'rtdb') return;
-
-      const tick = async () => {
-        if (stopped) return;
-        if (hasBackend) {
-          const res = await apiJson(`/api/users/profile/${encodeURIComponent(u)}`);
-          if (!stopped && res.ok && res.data?.success && Array.isArray(res.data.utrs)) {
-            const items = [...res.data.utrs];
-            items.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
-            cb(items);
-          }
-        } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-          const r = await rtdbFetch('utrs', 'GET');
-          if (!stopped && r.ok && r.data && typeof r.data === 'object') {
-            const items = Object.values(r.data).filter((w) => w && w.username === u);
-            items.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
-            cb(items);
-          }
+      const fetchExpressUtrs = async () => {
+        if (stopped || !hasBackend || !u || u === 'demo') return;
+        const res = await apiJson(`/api/users/profile/${encodeURIComponent(u)}`);
+        if (!stopped && res.ok && res.data?.success && Array.isArray(res.data.utrs)) {
+          expressUtrs = res.data.utrs;
+          mergeAndEmitUtrs();
         }
       };
 
-      void tick();
-      pollTimer = setInterval(() => void tick(), 2500);
+      if (hasBackend) {
+        ensureServerSseConnected();
+        void fetchExpressUtrs();
+        sseHandler = (detail) => {
+          if (!detail?.username || detail.username === u) {
+            void fetchExpressUtrs();
+          }
+        };
+        sseListeners.add(sseHandler);
+      }
+
+      if (!ctx && (hasBackend || (cfg.mode === 'rtdb' && cfg.rtdbUrl))) {
+        const tick = async () => {
+          if (stopped) return;
+          if (hasBackend) {
+            await fetchExpressUtrs();
+          } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+            const r = await rtdbFetch('utrs', 'GET');
+            if (!stopped && r.ok && r.data && typeof r.data === 'object') {
+              expressUtrs = Object.values(r.data).filter((w) => w && w.username === u);
+              mergeAndEmitUtrs();
+            }
+          }
+        };
+        void tick();
+        pollTimer = setInterval(() => void tick(), 2000);
+      }
     };
 
     void setupRemote();
@@ -1288,6 +1519,7 @@ const store = {
     return () => {
       stopped = true;
       localListeners.delete(emitLocal);
+      if (sseHandler) sseListeners.delete(sseHandler);
       if (typeof unsubFirestore === 'function') unsubFirestore();
       if (pollTimer) clearInterval(pollTimer);
     };
@@ -1300,23 +1532,22 @@ const store = {
       users[u].accountDetails = sanitized;
       saveLocalUsersMap(users);
     }
-
-    try {
-      await fsUpsertUser(u, { accountDetails: sanitized });
-    } catch {}
-
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/bank-details', {
-        method: 'POST',
-        body: JSON.stringify({ username: u, details: sanitized }),
-      });
-    }
+    broadcastSyncEvent('bank_details');
 
     const cfg = getActiveCloudConfig();
+    const tasks = [
+      fsUpsertUser(u, { accountDetails: sanitized }).catch((err) => {
+        console.error('Firestore saveAccountDetails error:', err);
+      }),
+      apiJson('/api/users/bank-details', {
+        method: 'POST',
+        body: JSON.stringify({ username: u, details: sanitized }),
+      }),
+    ];
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', { accountDetails: sanitized });
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', { accountDetails: sanitized }));
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('bank_details');
     return true;
   },
@@ -1328,23 +1559,22 @@ const store = {
       users[u].autodebitDetails = sanitized;
       saveLocalUsersMap(users);
     }
-
-    try {
-      await fsUpsertUser(u, { autodebitDetails: sanitized });
-    } catch {}
-
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/autodebit', {
-        method: 'POST',
-        body: JSON.stringify({ username: u, details: sanitized }),
-      });
-    }
+    broadcastSyncEvent('autodebit');
 
     const cfg = getActiveCloudConfig();
+    const tasks = [
+      fsUpsertUser(u, { autodebitDetails: sanitized }).catch((err) => {
+        console.error('Firestore saveAutodebitDetails error:', err);
+      }),
+      apiJson('/api/users/autodebit', {
+        method: 'POST',
+        body: JSON.stringify({ username: u, details: sanitized }),
+      }),
+    ];
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', { autodebitDetails: sanitized });
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', { autodebitDetails: sanitized }));
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('autodebit');
     return true;
   },
@@ -1353,26 +1583,11 @@ const store = {
     const uname = String(payload?.username || '').trim().slice(0, 64);
     if (!uname || uname === 'demo') return null;
 
-    const rec = payload.record || {};
-    const id = sanitizeSafeId(String(rec.id || ''), 'WTH');
-    const entry = {
-      id,
-      username: uname,
-      type: String(rec.type || 'UTR Submission').slice(0, 100),
-      amount: safeNum(rec.amount),
-      utr: String(rec.utr || '').slice(0, 64),
-      tokenNumber: String(rec.tokenNumber || rec.utr || '').slice(0, 64),
-      status: String(rec.status || 'Pending Admin Approval').slice(0, 80),
-      bank: String(rec.bank || '').slice(0, 120),
-      ifsc: String(rec.ifsc || '').slice(0, 20),
-      accNumber: String(rec.accNumber || '').slice(0, 32),
-      accountHolder: String(rec.accountHolder || '').slice(0, 120),
-      contact: String(rec.contact || '').slice(0, 20),
-      timestamp: String(rec.timestamp || new Date().toISOString()).slice(0, 64),
-    };
+    const entry = sanitizeUtrEntry(payload.record || {});
+    entry.username = uname;
 
     const utrs = getLocalUtrs();
-    const existingIdx = utrs.findIndex((x) => x && x.id === id);
+    const existingIdx = utrs.findIndex((x) => x && x.id === entry.id);
     if (existingIdx >= 0) utrs[existingIdx] = entry;
     else utrs.unshift(entry);
     saveLocalUtrs(utrs);
@@ -1385,27 +1600,41 @@ const store = {
       if (payload.activationCode) users[uname].activationCode = String(payload.activationCode).slice(0, 32);
       saveLocalUsersMap(users);
     }
+    broadcastSyncEvent('utr_submitted');
+
+    const act = pushLocalActivity(
+      uname,
+      payload.actionType || 'activation_utr',
+      payload.activityText || `Submitted ${entry.type}: ${entry.utr || entry.tokenNumber} (₹${entry.amount})`,
+      'payment',
+      'info'
+    );
 
     const fsCtx = await getFirestoreContext();
+    const cfg = getActiveCloudConfig();
+    const tasks = [];
+
     if (fsCtx) {
-      const utrPath = `${COLLECTIONS.utrs}/${id}`;
-      try {
-        await fsCtx.fs.setDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, id), entry);
-      } catch (err) {
-        handleFirestoreError(err, OperationType.CREATE, utrPath);
-      }
-      try {
-        await fsUpsertUser(uname, {
+      tasks.push(
+        fsCtx.fs.setDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, entry.id), entry).catch((err) => {
+          console.error('Firestore submitUtrRecord UTR error:', err);
+        })
+      );
+      tasks.push(
+        fsUpsertUser(uname, {
           activated: false,
           activationStatus: 'pending_approval',
           rejectionMessage: '',
           ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
-        });
-      } catch {}
+        }).catch((err) => {
+          console.error('Firestore submitUtrRecord user error:', err);
+        })
+      );
+      if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
     }
 
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/utr', {
+    tasks.push(
+      apiJson('/api/users/utr', {
         method: 'POST',
         body: JSON.stringify({
           username: uname,
@@ -1414,61 +1643,66 @@ const store = {
           actionType: payload.actionType,
           activityText: payload.activityText,
         }),
-      });
-    }
+      })
+    );
 
-    const cfg = getActiveCloudConfig();
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`utrs/${encodeURIComponent(id)}`, 'PUT', entry);
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-        activated: false,
-        activationStatus: 'pending_approval',
-        rejectionMessage: '',
-        ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
-      });
+      tasks.push(rtdbFetch(`utrs/${encodeURIComponent(entry.id)}`, 'PUT', entry));
+      tasks.push(
+        rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
+          activated: false,
+          activationStatus: 'pending_approval',
+          rejectionMessage: '',
+          ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
+        })
+      );
+      if (act) tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
     }
 
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('utr_submitted');
     return entry;
   },
 
-  async markActivationPending(u, code = '') {
+  async markActivationPending(u, code = '', forcePending = false) {
     const users = getLocalUsersMap();
-    if (users[u]) {
-      users[u].activated = false;
-      users[u].activationStatus = 'pending_approval';
-      users[u].rejectionMessage = '';
-      if (code) users[u].activationCode = String(code).slice(0, 32);
+    const existing = users[u];
+    const alreadyApproved = !forcePending && Boolean(existing && existing.activated === true && existing.activationStatus === 'approved');
+
+    if (existing) {
+      if (!alreadyApproved) {
+        existing.activated = false;
+        existing.activationStatus = 'pending_approval';
+        existing.rejectionMessage = '';
+      }
+      if (code) existing.activationCode = String(code).slice(0, 32);
       saveLocalUsersMap(users);
     }
 
-    try {
-      await fsUpsertUser(u, {
-        activated: false,
-        activationStatus: 'pending_approval',
-        rejectionMessage: '',
-        ...(code ? { activationCode: String(code).slice(0, 32) } : {}),
-      });
-    } catch {}
+    const patch = alreadyApproved
+      ? { ...(code ? { activationCode: String(code).slice(0, 32) } : {}) }
+      : {
+          activated: false,
+          activationStatus: 'pending_approval',
+          rejectionMessage: '',
+          ...(code ? { activationCode: String(code).slice(0, 32) } : {}),
+        };
 
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/activate', {
-        method: 'POST',
-        body: JSON.stringify({ username: u, activationCode: code, pendingOnly: true }),
-      });
-    }
+    broadcastSyncEvent(alreadyApproved ? 'activation_already_approved' : 'activation_pending');
 
     const cfg = getActiveCloudConfig();
-    if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', {
-        activated: false,
-        activationStatus: 'pending_approval',
-        rejectionMessage: '',
-        ...(code ? { activationCode: String(code).slice(0, 32) } : {}),
-      });
+    const tasks = [
+      fsUpsertUser(u, patch).catch(() => {}),
+      apiJson('/api/users/activate', {
+        method: 'POST',
+        body: JSON.stringify({ username: u, activationCode: code, pendingOnly: true, forcePending }),
+      }),
+    ];
+    if (cfg.mode === 'rtdb' && cfg.rtdbUrl && Object.keys(patch).length > 0) {
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', patch));
     }
-
-    broadcastSyncEvent('activation_pending');
+    await Promise.allSettled(tasks);
+    broadcastSyncEvent(alreadyApproved ? 'activation_already_approved' : 'activation_pending');
     return true;
   },
 
@@ -1514,35 +1748,34 @@ const store = {
         }
       : null;
 
-    try {
-      await fsUpsertUser(uname, {
+    broadcastSyncEvent('transaction');
+
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      fsUpsertUser(uname, {
         balance: safeNum(payload.balance),
         commission: safeNum(payload.commission),
         transactions: nextTxns,
-      });
-      if (smsEntry) await fsCreateSms(smsEntry);
-    } catch {}
-
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/transaction', {
+      }).catch(() => {}),
+      apiJson('/api/users/transaction', {
         method: 'POST',
         body: JSON.stringify(payload),
-      });
-    }
-
-    const cfg = getActiveCloudConfig();
+      }),
+    ];
+    if (smsEntry) tasks.push(fsCreateSms(smsEntry).catch(() => {}));
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl && users[uname]) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-        balance: users[uname].balance,
-        commission: users[uname].commission,
-        transactions: users[uname].transactions,
-      });
+      tasks.push(
+        rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
+          balance: users[uname].balance,
+          commission: users[uname].commission,
+          transactions: users[uname].transactions,
+        })
+      );
       if (smsEntry) {
-        await rtdbFetch(`smsLogs/${encodeURIComponent(smsEntry.id)}`, 'PUT', smsEntry);
+        tasks.push(rtdbFetch(`smsLogs/${encodeURIComponent(smsEntry.id)}`, 'PUT', smsEntry));
       }
     }
-
-    broadcastSyncEvent('transaction');
+    await Promise.allSettled(tasks);
     return true;
   },
 
@@ -1559,63 +1792,52 @@ const store = {
       users[u].transactions = [];
       saveLocalUsersMap(users);
     }
+    broadcastSyncEvent('bank_removed');
 
-    try {
-      await fsUpsertUser(u, {
-        accountDetails: null,
-        autodebitDetails: null,
-        activated: false,
-        activationStatus: 'not_submitted',
-        rejectionMessage: '',
-        balance: 0,
-        commission: 0,
-        transactions: [],
-      });
-    } catch {}
-
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/remove-bank', {
+    const resetPatch = {
+      accountDetails: null,
+      autodebitDetails: null,
+      activated: false,
+      activationStatus: 'not_submitted',
+      rejectionMessage: '',
+      balance: 0,
+      commission: 0,
+      transactions: [],
+    };
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      fsUpsertUser(u, resetPatch).catch(() => {}),
+      apiJson('/api/users/remove-bank', {
         method: 'POST',
         body: JSON.stringify({ username: u }),
-      });
-    }
-
-    const cfg = getActiveCloudConfig();
+      }),
+    ];
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', {
-        accountDetails: null,
-        autodebitDetails: null,
-        activated: false,
-        activationStatus: 'not_submitted',
-        rejectionMessage: '',
-        balance: 0,
-        commission: 0,
-        transactions: [],
-      });
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', resetPatch));
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('bank_removed');
     return true;
   },
 
   async logActivity(username, actionType, details, category = 'general', status = 'success', mobileOverride = '') {
     const entry = pushLocalActivity(username, actionType, details, category, status, mobileOverride);
-    if (entry) {
-      try {
-        await fsCreateActivity(entry);
-      } catch {}
-    }
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/users/activity', {
+    broadcastSyncEvent('activity');
+
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      apiJson('/api/users/activity', {
         method: 'POST',
         body: JSON.stringify({ username, actionType, details, category, status }),
-      });
+      }),
+    ];
+    if (entry) {
+      tasks.push(fsCreateActivity(entry).catch(() => {}));
+      if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+        tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(entry.id)}`, 'PUT', entry));
+      }
     }
-    const cfg = getActiveCloudConfig();
-    if (cfg.mode === 'rtdb' && cfg.rtdbUrl && entry) {
-      await rtdbFetch(`activityLogs/${encodeURIComponent(entry.id)}`, 'PUT', entry);
-    }
-    broadcastSyncEvent('activity');
+    await Promise.allSettled(tasks);
     return entry;
   },
 
@@ -1656,45 +1878,132 @@ const store = {
   subscribeAdminDashboard(cb) {
     let stopped = false;
     let pollTimer = null;
+    let sseHandler = null;
     const unsubs = [];
 
-    const state = {
-      usersMap: getLocalUsersMap(),
-      utrs: getLocalUtrs(),
-      activityLogs: getLocalActivityLogs(),
-      smsLogs: getLocalSmsLogs(),
+    const fsState = {
+      usersMap: null,
+      utrs: null,
+      activityLogs: null,
+      smsLogs: null,
+    };
+    const expressState = {
+      usersMap: null,
+      utrs: null,
+      activityLogs: null,
+      smsLogs: null,
     };
 
-    const emitState = () => {
+    const statusScore = (s) => {
+      const str = String(s || '').toLowerCase();
+      if (str.includes('approved') || str.includes('receipt') || str.includes('activated')) return 3;
+      if (str.includes('rejected')) return 2;
+      return 1;
+    };
+
+    const sortByTimeDesc = (arr) =>
+      arr.sort((a, b) => new Date(b?.timestamp || 0).getTime() - new Date(a?.timestamp || 0).getTime());
+
+    const mergeAndEmit = () => {
       if (stopped) return;
+      const nowMs = Date.now();
+      for (const [delU, exp] of recentlyDeletedUsers.entries()) {
+        if (exp <= nowMs) recentlyDeletedUsers.delete(delU);
+      }
+      const isRecentlyDeleted = (uname) => {
+        const exp = recentlyDeletedUsers.get(uname);
+        return Boolean(exp && exp > nowMs);
+      };
+
+      const mergedUsers = {};
+      Object.entries(getLocalUsersMap()).forEach(([uname, uObj]) => {
+        if (uObj && uname !== 'demo' && !isRecentlyDeleted(uname)) {
+          mergedUsers[uname] = uObj;
+        }
+      });
+      const applyUsersMap = (uMap) => {
+        if (!uMap || typeof uMap !== 'object') return;
+        Object.entries(uMap).forEach(([uname, uObj]) => {
+          if (!uObj || uname === 'demo' || isRecentlyDeleted(uname)) return;
+          const prev = mergedUsers[uname];
+          if (!prev) {
+            mergedUsers[uname] = uObj;
+            return;
+          }
+          const prevTxns = Array.isArray(prev.transactions) ? prev.transactions : [];
+          const nextTxns = Array.isArray(uObj.transactions) ? uObj.transactions : [];
+          const prevTime = new Date(prev.lastLoginAt || prev.registeredAt || 0).getTime();
+          const nextTime = new Date(uObj.lastLoginAt || uObj.registeredAt || 0).getTime();
+          const preferNextStatus =
+            uObj.activationStatus === 'approved' ||
+            uObj.activationStatus === 'rejected' ||
+            (prev.activationStatus !== 'approved' && uObj.activationStatus === 'pending_approval') ||
+            nextTime >= prevTime;
+
+          mergedUsers[uname] = {
+            ...prev,
+            ...uObj,
+            accountDetails: uObj.accountDetails || prev.accountDetails || null,
+            autodebitDetails: uObj.autodebitDetails || prev.autodebitDetails || null,
+            transactions: nextTxns.length >= prevTxns.length ? nextTxns : prevTxns,
+            activated: preferNextStatus ? Boolean(uObj.activated) : Boolean(prev.activated),
+            activationStatus: preferNextStatus
+              ? (uObj.activationStatus || (uObj.activated ? 'approved' : 'not_submitted'))
+              : (prev.activationStatus || (prev.activated ? 'approved' : 'not_submitted')),
+            rejectionMessage: preferNextStatus ? (uObj.rejectionMessage || '') : (prev.rejectionMessage || ''),
+          };
+        });
+      };
+
+      applyUsersMap(expressState.usersMap);
+      applyUsersMap(fsState.usersMap);
+
+      const mergeById = (lists, preferStatus = false) => {
+        const byId = new Map();
+        lists.forEach((arr) => {
+          (Array.isArray(arr) ? arr : []).forEach((item) => {
+            if (!item || !item.id) return;
+            const prev = byId.get(item.id);
+            if (!prev) {
+              byId.set(item.id, item);
+            } else if (!preferStatus || statusScore(item.status) >= statusScore(prev.status)) {
+              byId.set(item.id, { ...prev, ...item });
+            }
+          });
+        });
+        return sortByTimeDesc(Array.from(byId.values()));
+      };
+
+      const utrs = mergeById([getLocalUtrs(), expressState.utrs, fsState.utrs], true);
+      const activityLogs = mergeById([getLocalActivityLogs(), expressState.activityLogs, fsState.activityLogs], false);
+      const smsLogs = mergeById([getLocalSmsLogs(), expressState.smsLogs, fsState.smsLogs], false);
+
+      saveLocalUsersMap(mergedUsers);
+      if (utrs.length > 0) saveLocalUtrs(utrs);
+      if (activityLogs.length > 0) saveLocalActivityLogs(activityLogs);
+      if (smsLogs.length > 0) saveLocalSmsLogs(smsLogs);
+
       cb({
-        usersMap: { ...state.usersMap },
-        utrs: [...state.utrs],
-        activityLogs: [...state.activityLogs],
-        smsLogs: [...state.smsLogs],
+        usersMap: mergedUsers,
+        utrs,
+        activityLogs,
+        smsLogs,
       });
     };
 
     const emitLocal = () => {
-      state.usersMap = { ...state.usersMap, ...getLocalUsersMap() };
-      const localUtrs = getLocalUtrs();
-      if (localUtrs.length && state.utrs.length === 0) state.utrs = localUtrs;
-      const localLogs = getLocalActivityLogs();
-      if (localLogs.length && state.activityLogs.length === 0) state.activityLogs = localLogs;
-      const localSms = getLocalSmsLogs();
-      if (localSms.length && state.smsLogs.length === 0) state.smsLogs = localSms;
-      emitState();
+      if (stopped) return;
+      mergeAndEmit();
     };
 
     localListeners.add(emitLocal);
     emitLocal();
 
     const setupRemote = async () => {
-      const ctx = await getFirestoreContext();
-      if (!stopped && ctx) {
-        const sortByTimeDesc = (arr) =>
-          arr.sort((a, b) => new Date(b?.timestamp || 0).getTime() - new Date(a?.timestamp || 0).getTime());
+      const [ctx, hasBackend] = await Promise.all([getFirestoreContext(), isExpressBackendAvailable()]);
+      const cfg = getActiveCloudConfig();
 
+      if (!stopped && ctx) {
         unsubs.push(
           ctx.fs.onSnapshot(
             ctx.fs.collection(ctx.db, COLLECTIONS.users),
@@ -1707,9 +2016,8 @@ const store = {
                   nextMap[u.username] = u;
                 }
               });
-              state.usersMap = nextMap;
-              saveLocalUsersMap(nextMap);
-              emitState();
+              fsState.usersMap = nextMap;
+              mergeAndEmit();
             },
             (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.users)
           )
@@ -1720,10 +2028,8 @@ const store = {
             ctx.fs.collection(ctx.db, COLLECTIONS.utrs),
             (qs) => {
               if (stopped) return;
-              const list = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
-              state.utrs = list;
-              saveLocalUtrs(list);
-              emitState();
+              fsState.utrs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
+              mergeAndEmit();
             },
             (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.utrs)
           )
@@ -1734,10 +2040,8 @@ const store = {
             ctx.fs.collection(ctx.db, COLLECTIONS.activityLogs),
             (qs) => {
               if (stopped) return;
-              const list = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
-              state.activityLogs = list;
-              saveLocalActivityLogs(list);
-              emitState();
+              fsState.activityLogs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
+              mergeAndEmit();
             },
             (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.activityLogs)
           )
@@ -1748,50 +2052,58 @@ const store = {
             ctx.fs.collection(ctx.db, COLLECTIONS.smsLogs),
             (qs) => {
               if (stopped) return;
-              const list = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
-              state.smsLogs = list;
-              saveLocalSmsLogs(list);
-              emitState();
+              fsState.smsLogs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
+              mergeAndEmit();
             },
             (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.smsLogs)
           )
         );
-        return;
       }
 
-      const hasBackend = await isExpressBackendAvailable();
-      const cfg = getActiveCloudConfig();
-      if (!hasBackend && cfg.mode !== 'rtdb') return;
-
-      const tick = async () => {
-        if (stopped) return;
-        if (hasBackend) {
-          const token = getStoredAdminToken();
-          if (!token) return;
-          const res = await apiJson('/api/admin/dashboard-data', {
-            headers: { 'x-admin-token': token },
-          });
-          if (!stopped && res.ok && res.data?.success) {
-            state.usersMap = res.data.usersMap || {};
-            state.utrs = res.data.utrs || [];
-            state.activityLogs = res.data.activityLogs || [];
-            state.smsLogs = res.data.smsLogs || [];
-            emitState();
-          }
-        } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-          const remote = await pullAllFromRtdbIfConfigured();
-          if (!stopped && remote) {
-            state.usersMap = remote.usersMap || {};
-            state.utrs = remote.utrs || [];
-            state.activityLogs = remote.activityLogs || [];
-            state.smsLogs = remote.smsLogs || [];
-            emitState();
-          }
+      const fetchExpressDashboard = async () => {
+        if (stopped || !hasBackend) return;
+        const token = getStoredAdminToken();
+        if (!token) return;
+        const res = await apiJson('/api/admin/dashboard-data', {
+          headers: { 'x-admin-token': token },
+        });
+        if (!stopped && res.ok && res.data?.success) {
+          expressState.usersMap = res.data.usersMap || {};
+          expressState.utrs = res.data.utrs || [];
+          expressState.activityLogs = res.data.activityLogs || [];
+          expressState.smsLogs = res.data.smsLogs || [];
+          mergeAndEmit();
         }
       };
 
-      void tick();
-      pollTimer = setInterval(() => void tick(), 2500);
+      if (hasBackend) {
+        ensureServerSseConnected();
+        void fetchExpressDashboard();
+        sseHandler = () => {
+          void fetchExpressDashboard();
+        };
+        sseListeners.add(sseHandler);
+      }
+
+      if (!ctx && (hasBackend || (cfg.mode === 'rtdb' && cfg.rtdbUrl))) {
+        const tick = async () => {
+          if (stopped) return;
+          if (hasBackend) {
+            await fetchExpressDashboard();
+          } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+            const remote = await pullAllFromRtdbIfConfigured();
+            if (!stopped && remote) {
+              expressState.usersMap = remote.usersMap || {};
+              expressState.utrs = remote.utrs || [];
+              expressState.activityLogs = remote.activityLogs || [];
+              expressState.smsLogs = remote.smsLogs || [];
+              mergeAndEmit();
+            }
+          }
+        };
+        void tick();
+        pollTimer = setInterval(() => void tick(), 2000);
+      }
     };
 
     void setupRemote();
@@ -1799,6 +2111,7 @@ const store = {
     return () => {
       stopped = true;
       localListeners.delete(emitLocal);
+      if (sseHandler) sseListeners.delete(sseHandler);
       unsubs.forEach((uFn) => {
         try {
           if (typeof uFn === 'function') uFn();
@@ -1808,9 +2121,9 @@ const store = {
     };
   },
 
-  async adminApproveUtr(utrId, uname) {
+  async adminApproveUtr(utrId, uname, itemHint = null) {
     const utrs = getLocalUtrs();
-    let item = utrs.find((u) => u && (u.id === utrId || u.utr === utrId));
+    let item = utrs.find((u) => u && (u.id === utrId || u.utr === utrId)) || itemHint || null;
 
     const fsCtx = await getFirestoreContext();
     if (!item && fsCtx && utrId) {
@@ -1820,6 +2133,7 @@ const store = {
       } catch {}
     }
 
+    const resolvedUname = String(uname || item?.username || '').trim();
     const is199 = Boolean(
       item &&
         (Number(item.amount) === 199 ||
@@ -1830,130 +2144,205 @@ const store = {
 
     if (item) {
       item.status = nextStatus;
+      const idx = utrs.findIndex((u) => u && (u.id === item.id || u.id === utrId));
+      if (idx >= 0) utrs[idx] = { ...utrs[idx], status: nextStatus };
+      else utrs.unshift({ ...item, status: nextStatus });
       saveLocalUtrs(utrs);
     }
 
-    const users = getLocalUsersMap();
-    if (users[uname]) {
-      users[uname].activated = true;
-      users[uname].activationStatus = 'approved';
-      users[uname].rejectionMessage = '';
-      saveLocalUsersMap(users);
+    if (resolvedUname) {
+      const users = getLocalUsersMap();
+      if (users[resolvedUname]) {
+        users[resolvedUname].activated = true;
+        users[resolvedUname].activationStatus = 'approved';
+        users[resolvedUname].rejectionMessage = '';
+        saveLocalUsersMap(users);
+      }
     }
 
-    const act = pushLocalActivity(
-      uname,
-      'admin_approve',
-      is199 ? `Admin verified ₹199 UTR (${item?.utr || utrId}) & issued receipt` : `Admin approved ₹399 UTR (${item?.utr || utrId}) & started panel`,
-      'admin',
-      'success'
-    );
+    const act = resolvedUname
+      ? pushLocalActivity(
+          resolvedUname,
+          'admin_approve',
+          is199
+            ? `Admin verified ₹199 UTR (${item?.utr || utrId}) & issued receipt`
+            : `Admin approved ₹399 UTR (${item?.utr || utrId}) & started panel`,
+          'admin',
+          'success'
+        )
+      : null;
 
+    broadcastSyncEvent('admin_approve_utr');
+
+    const tasks = [];
     if (fsCtx) {
-      const targetDocId = item?.id || utrId;
+      const targetDocId = sanitizeSafeId(String(item?.id || utrId || ''), 'WTH');
       if (targetDocId) {
-        const utrPath = `${COLLECTIONS.utrs}/${targetDocId}`;
-        try {
-          await fsCtx.fs.updateDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, targetDocId), { status: nextStatus });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, utrPath);
-        }
+        tasks.push(
+          (async () => {
+            try {
+              const utrRef = fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, targetDocId);
+              const existingUtr = await fsCtx.fs.getDoc(utrRef);
+              if (existingUtr.exists()) {
+                await fsCtx.fs.updateDoc(utrRef, { status: nextStatus });
+              } else {
+                const fullUtr = sanitizeUtrEntry(
+                  item || {
+                    id: targetDocId,
+                    username: resolvedUname || 'user',
+                    type: is199 ? 'Upgrade Limit (₹199)' : 'Activation Payment (₹399)',
+                    amount: is199 ? 199 : 399,
+                    utr: String(utrId || ''),
+                    tokenNumber: String(utrId || ''),
+                  },
+                  targetDocId,
+                  nextStatus
+                );
+                await fsCtx.fs.setDoc(utrRef, fullUtr);
+              }
+            } catch (err) {
+              console.error('Firestore adminApproveUtr UTR write warning:', err);
+            }
+          })()
+        );
       }
-      if (uname) {
-        await fsUpsertUser(uname, {
-          activated: true,
-          activationStatus: 'approved',
-          rejectionMessage: '',
-        });
+      if (resolvedUname) {
+        tasks.push(
+          fsUpsertUser(resolvedUname, {
+            activated: true,
+            activationStatus: 'approved',
+            rejectionMessage: '',
+          }).catch((err) => {
+            console.error('Firestore adminApproveUtr user activate error:', err);
+          })
+        );
       }
-      if (act) await fsCreateActivity(act);
+      if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
     }
 
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/admin/utr/approve', {
+    tasks.push(
+      apiJson('/api/admin/utr/approve', {
         method: 'POST',
         headers: { 'x-admin-token': getStoredAdminToken() },
-        body: JSON.stringify({ utrId, username: uname }),
-      });
-    }
+        body: JSON.stringify({ utrId, username: resolvedUname, utrRecord: item }),
+      })
+    );
 
     const cfg = getActiveCloudConfig();
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      if (item?.id) await rtdbFetch(`utrs/${encodeURIComponent(item.id)}`, 'PATCH', { status: nextStatus });
-      if (uname) {
-        await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-          activated: true,
-          activationStatus: 'approved',
-          rejectionMessage: '',
-        });
+      if (item?.id) tasks.push(rtdbFetch(`utrs/${encodeURIComponent(item.id)}`, 'PATCH', { status: nextStatus }));
+      if (resolvedUname) {
+        tasks.push(
+          rtdbFetch(`users/${encodeURIComponent(toDocId(resolvedUname))}`, 'PATCH', {
+            activated: true,
+            activationStatus: 'approved',
+            rejectionMessage: '',
+          })
+        );
       }
     }
 
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('admin_approve_utr');
     return true;
   },
 
-  async adminRejectUtr(utrId, uname) {
+  async adminRejectUtr(utrId, uname, itemHint = null) {
     const rejectMsg = 'ADMIN REJECTED YOUR PAYMENT. KINDLY PAY THE CHARGES AND RUN.';
     const utrs = getLocalUtrs();
-    const item = utrs.find((u) => u && (u.id === utrId || u.utr === utrId));
+    let item = utrs.find((u) => u && (u.id === utrId || u.utr === utrId)) || itemHint || null;
     const nextStatus = '❌ Rejected (Invalid UTR)';
+
+    const fsCtx = await getFirestoreContext();
+    if (!item && fsCtx && utrId) {
+      try {
+        const snap = await fsCtx.fs.getDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, utrId));
+        if (snap.exists()) item = snap.data();
+      } catch {}
+    }
+
+    const resolvedUname = String(uname || item?.username || '').trim();
     if (item) {
       item.status = nextStatus;
+      const idx = utrs.findIndex((u) => u && (u.id === item.id || u.id === utrId));
+      if (idx >= 0) utrs[idx] = { ...utrs[idx], status: nextStatus };
+      else utrs.unshift({ ...item, status: nextStatus });
       saveLocalUtrs(utrs);
     }
 
-    const users = getLocalUsersMap();
-    if (users[uname]) {
-      users[uname].activated = false;
-      users[uname].activationStatus = 'rejected';
-      users[uname].rejectionMessage = rejectMsg;
-      saveLocalUsersMap(users);
+    if (resolvedUname) {
+      const users = getLocalUsersMap();
+      if (users[resolvedUname]) {
+        users[resolvedUname].activated = false;
+        users[resolvedUname].activationStatus = 'rejected';
+        users[resolvedUname].rejectionMessage = rejectMsg;
+        saveLocalUsersMap(users);
+      }
     }
 
-    const act = pushLocalActivity(uname, 'admin_reject', `Admin rejected UTR (${item?.utr || utrId})`, 'admin', 'warning');
+    const act = resolvedUname
+      ? pushLocalActivity(resolvedUname, 'admin_reject', `Admin rejected UTR (${item?.utr || utrId})`, 'admin', 'warning')
+      : null;
 
-    const fsCtx = await getFirestoreContext();
+    broadcastSyncEvent('admin_reject_utr');
+
+    const tasks = [];
     if (fsCtx) {
-      const targetDocId = item?.id || utrId;
+      const targetDocId = sanitizeSafeId(String(item?.id || utrId || ''), 'WTH');
       if (targetDocId) {
-        const utrPath = `${COLLECTIONS.utrs}/${targetDocId}`;
-        try {
-          await fsCtx.fs.updateDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, targetDocId), { status: nextStatus });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, utrPath);
-        }
+        tasks.push(
+          (async () => {
+            try {
+              const utrRef = fsCtx.fs.doc(fsCtx.db, COLLECTIONS.utrs, targetDocId);
+              const existingUtr = await fsCtx.fs.getDoc(utrRef);
+              if (existingUtr.exists()) {
+                await fsCtx.fs.updateDoc(utrRef, { status: nextStatus });
+              } else if (item) {
+                await fsCtx.fs.setDoc(utrRef, sanitizeUtrEntry(item, targetDocId, nextStatus));
+              }
+            } catch (err) {
+              console.error('Firestore adminRejectUtr UTR write warning:', err);
+            }
+          })()
+        );
       }
-      if (uname) {
-        await fsUpsertUser(uname, {
-          activated: false,
-          activationStatus: 'rejected',
-          rejectionMessage: rejectMsg,
-        });
+      if (resolvedUname) {
+        tasks.push(
+          fsUpsertUser(resolvedUname, {
+            activated: false,
+            activationStatus: 'rejected',
+            rejectionMessage: rejectMsg,
+          }).catch((err) => {
+            console.error('Firestore adminRejectUtr user reject error:', err);
+          })
+        );
       }
-      if (act) await fsCreateActivity(act);
+      if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
     }
 
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/admin/utr/reject', {
+    tasks.push(
+      apiJson('/api/admin/utr/reject', {
         method: 'POST',
         headers: { 'x-admin-token': getStoredAdminToken() },
-        body: JSON.stringify({ utrId, username: uname }),
-      });
-    }
+        body: JSON.stringify({ utrId, username: resolvedUname, utrRecord: item }),
+      })
+    );
 
     const cfg = getActiveCloudConfig();
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      if (item?.id) await rtdbFetch(`utrs/${encodeURIComponent(item.id)}`, 'PATCH', { status: nextStatus });
-      if (uname) {
-        await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-          activated: false,
-          activationStatus: 'rejected',
-          rejectionMessage: rejectMsg,
-        });
+      if (item?.id) tasks.push(rtdbFetch(`utrs/${encodeURIComponent(item.id)}`, 'PATCH', { status: nextStatus }));
+      if (resolvedUname) {
+        tasks.push(
+          rtdbFetch(`users/${encodeURIComponent(toDocId(resolvedUname))}`, 'PATCH', {
+            activated: false,
+            activationStatus: 'rejected',
+            rejectionMessage: rejectMsg,
+          })
+        );
       }
     }
 
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('admin_reject_utr');
     return true;
   },
@@ -1968,39 +2357,42 @@ const store = {
     }
 
     const act = pushLocalActivity(uname, 'admin_approve', 'Admin approved panel & started transactions', 'admin', 'success');
+    broadcastSyncEvent('admin_approve_user');
 
-    try {
-      await fsUpsertUser(uname, {
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      fsUpsertUser(uname, {
         activated: true,
         activationStatus: 'approved',
         rejectionMessage: '',
-      });
-      if (act) await fsCreateActivity(act);
-    } catch {}
-
-    if (await isExpressBackendAvailable()) {
-      const res = await apiJson('/api/admin/approve-user', {
+      }).catch((err) => {
+        console.error('Firestore adminApproveUserPanel error:', err);
+      }),
+      apiJson('/api/admin/approve-user', {
         method: 'POST',
         headers: { 'x-admin-token': getStoredAdminToken() },
         body: JSON.stringify({ username: uname }),
-      });
-      if (res.ok && res.data?.user) {
-        users[uname] = res.data.user;
-        saveLocalUsersMap(users);
-      }
-    }
-
-    const cfg = getActiveCloudConfig();
+      }).then((res) => {
+        if (res.ok && res.data?.user) {
+          const curUsers = getLocalUsersMap();
+          curUsers[uname] = res.data.user;
+          saveLocalUsersMap(curUsers);
+        }
+      }),
+    ];
+    if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-        activated: true,
-        activationStatus: 'approved',
-        rejectionMessage: '',
-      });
+      tasks.push(
+        rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
+          activated: true,
+          activationStatus: 'approved',
+          rejectionMessage: '',
+        })
+      );
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('admin_approve_user');
-    return users[uname] || null;
+    return getLocalUsersMap()[uname] || null;
   },
 
   async adminRejectUserPayment(uname) {
@@ -2014,39 +2406,42 @@ const store = {
     }
 
     const act = pushLocalActivity(uname, 'admin_reject', 'Admin rejected payment — awaiting charges resubmission', 'admin', 'warning');
+    broadcastSyncEvent('admin_reject_user');
 
-    try {
-      await fsUpsertUser(uname, {
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      fsUpsertUser(uname, {
         activated: false,
         activationStatus: 'rejected',
         rejectionMessage: msg,
-      });
-      if (act) await fsCreateActivity(act);
-    } catch {}
-
-    if (await isExpressBackendAvailable()) {
-      const res = await apiJson('/api/admin/reject-user', {
+      }).catch((err) => {
+        console.error('Firestore adminRejectUserPayment error:', err);
+      }),
+      apiJson('/api/admin/reject-user', {
         method: 'POST',
         headers: { 'x-admin-token': getStoredAdminToken() },
         body: JSON.stringify({ username: uname }),
-      });
-      if (res.ok && res.data?.user) {
-        users[uname] = res.data.user;
-        saveLocalUsersMap(users);
-      }
-    }
-
-    const cfg = getActiveCloudConfig();
+      }).then((res) => {
+        if (res.ok && res.data?.user) {
+          const curUsers = getLocalUsersMap();
+          curUsers[uname] = res.data.user;
+          saveLocalUsersMap(curUsers);
+        }
+      }),
+    ];
+    if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-        activated: false,
-        activationStatus: 'rejected',
-        rejectionMessage: msg,
-      });
+      tasks.push(
+        rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
+          activated: false,
+          activationStatus: 'rejected',
+          rejectionMessage: msg,
+        })
+      );
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('admin_reject_user');
-    return users[uname] || null;
+    return getLocalUsersMap()[uname] || null;
   },
 
   async adminToggleUserActivation(uname, curr) {
@@ -2055,71 +2450,68 @@ const store = {
   },
 
   async adminDeleteUser(uname) {
+    if (uname) recentlyDeletedUsers.set(uname, Date.now() + 15000);
     const users = getLocalUsersMap();
     if (users[uname]) {
       delete users[uname];
       saveLocalUsersMap(users);
     }
     saveLocalUtrs(getLocalUtrs().filter((w) => w && w.username !== uname));
+    broadcastSyncEvent('admin_delete_user');
 
     const fsCtx = await getFirestoreContext();
-    if (fsCtx && uname) {
-      const docId = toDocId(uname);
-      const userPath = `${COLLECTIONS.users}/${docId}`;
-      try {
-        await fsCtx.fs.deleteDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.users, docId));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.DELETE, userPath);
-      }
-      try {
-        const uQ = fsCtx.fs.query(fsCtx.fs.collection(fsCtx.db, COLLECTIONS.utrs), fsCtx.fs.where('username', '==', uname));
-        const uSnap = await fsCtx.fs.getDocs(uQ);
-        await Promise.all(uSnap.docs.map((d) => fsCtx.fs.deleteDoc(d.ref)));
-      } catch {}
-    }
-
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/admin/delete-user', {
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      apiJson('/api/admin/delete-user', {
         method: 'POST',
         headers: { 'x-admin-token': getStoredAdminToken() },
         body: JSON.stringify({ username: uname }),
-      });
+      }),
+    ];
+    if (fsCtx && uname) {
+      const docId = toDocId(uname);
+      tasks.push(
+        fsCtx.fs.deleteDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.users, docId)).catch(() => {})
+      );
+      tasks.push(
+        fsCtx.fs
+          .getDocs(fsCtx.fs.query(fsCtx.fs.collection(fsCtx.db, COLLECTIONS.utrs), fsCtx.fs.where('username', '==', uname)))
+          .then((uSnap) => Promise.all(uSnap.docs.map((d) => fsCtx.fs.deleteDoc(d.ref))))
+          .catch(() => {})
+      );
     }
-
-    const cfg = getActiveCloudConfig();
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'DELETE');
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'DELETE'));
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('admin_delete_user');
     return true;
   },
 
   async adminClearLogs() {
     saveLocalActivityLogs([]);
+    broadcastSyncEvent('admin_clear_logs');
 
     const fsCtx = await getFirestoreContext();
-    if (fsCtx) {
-      try {
-        const snap = await fsCtx.fs.getDocs(fsCtx.fs.collection(fsCtx.db, COLLECTIONS.activityLogs));
-        await Promise.all(snap.docs.map((d) => fsCtx.fs.deleteDoc(d.ref)));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.DELETE, COLLECTIONS.activityLogs);
-      }
-    }
-
-    if (await isExpressBackendAvailable()) {
-      await apiJson('/api/admin/clear-logs', {
+    const cfg = getActiveCloudConfig();
+    const tasks = [
+      apiJson('/api/admin/clear-logs', {
         method: 'POST',
         headers: { 'x-admin-token': getStoredAdminToken() },
-      });
+      }),
+    ];
+    if (fsCtx) {
+      tasks.push(
+        fsCtx.fs
+          .getDocs(fsCtx.fs.collection(fsCtx.db, COLLECTIONS.activityLogs))
+          .then((snap) => Promise.all(snap.docs.map((d) => fsCtx.fs.deleteDoc(d.ref))))
+          .catch(() => {})
+      );
     }
-
-    const cfg = getActiveCloudConfig();
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      await rtdbFetch('activityLogs', 'DELETE');
+      tasks.push(rtdbFetch('activityLogs', 'DELETE'));
     }
-
+    await Promise.allSettled(tasks);
     broadcastSyncEvent('admin_clear_logs');
     return true;
   },
@@ -2145,16 +2537,6 @@ const store = {
     return true;
   },
 };
-
-function finalDocOverride(u) {
-  return {
-    lastLoginAt: u.lastLoginAt || '',
-    loginCount: safeNum(u.loginCount),
-    loginHistory: Array.isArray(u.loginHistory) ? u.loginHistory : [],
-    balance: safeNum(u.balance),
-    commission: safeNum(u.commission),
-  };
-}
 
 if (typeof window !== 'undefined') {
   window.FirebaseStore = store;
