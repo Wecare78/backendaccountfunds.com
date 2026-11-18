@@ -6,8 +6,14 @@
     <meta name="theme-color" content="#050a14">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>Account Funds - Admin Control Portal</title>
-    <meta name="description" content="Account Funds Independent Admin Control Portal - Real-time User Activity, UTR Approvals, Bank Accounts, and Audit Trail." />
+    <title>Account Funds</title>
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Account Funds" />
+    <meta property="og:image" content="/assets/aistudio/6336683526505306283_83146722.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Account Funds" />
+    <meta name="twitter:image" content="/assets/aistudio/6336683526505306283_83146722.jpg" />
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='40' y2='40' gradientUnits='userSpaceOnUse'%3E%3Cstop stop-color='%2300E5FF'/%3E%3Cstop offset='1' stop-color='%232563EB'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M20 2L35 10.5V29.5L20 38L5 29.5V10.5L20 2Z' fill='url(%23g)'/%3E%3Cpath d='M25 13H15V20H23M15 20V27H25' stroke='%23041022' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="./style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -99,8 +105,8 @@
                     </svg>
                 </div>
                 <div>
-                    <h1 class="admin-title">Account<span class="accent-cyan">Funds</span> <span class="badge-role">INDEPENDENT PANEL ADMIN</span></h1>
-                    <p class="admin-subtitle">Dedicated Cloud Portal • Isolated User Roster, UTRs, Credits/Debits &amp; Logs</p>
+                    <h1 class="admin-title">Account<span class="accent-cyan">Funds</span> <span class="badge-role">ADMIN PORTAL</span></h1>
+                    <p class="admin-subtitle">Real-time Cloud Sync • User Roster, UTR Approvals &amp; Audit Trail</p>
                 </div>
             </div>
 
@@ -217,22 +223,22 @@
         <div class="admin-tabs-nav">
             <button type="button" class="admin-tab-btn active" data-tab="userRoster">
                 <span class="tab-icon">👤</span>
-                <span>All Users &amp; Logins ("Kitne Log" • Click User)</span>
+                <span>User Roster</span>
                 <span class="tab-count-badge" id="userRosterCountBadge">0</span>
             </button>
             <button type="button" class="admin-tab-btn" data-tab="withdrawalsQueue">
                 <span class="tab-icon">💳</span>
-                <span>Customer UTRs &amp; Withdrawals</span>
+                <span>UTRs &amp; Withdrawals</span>
                 <span class="tab-count-badge" id="withdrawalsCountBadge">0</span>
             </button>
             <button type="button" class="admin-tab-btn" data-tab="activityLogs">
                 <span class="tab-icon">📜</span>
-                <span>Activity Audit Logs ("Kisne Kya Kiya")</span>
+                <span>Activity Logs</span>
                 <span class="tab-count-badge" id="activityLogsCountBadge">0</span>
             </button>
             <button type="button" class="admin-tab-btn" data-tab="smsNotifications">
                 <span class="tab-icon">📲</span>
-                <span>Truecaller SMS Broadcast Log</span>
+                <span>SMS Broadcast</span>
                 <span class="tab-count-badge" id="smsNotifCountBadge">0</span>
             </button>
         </div>
@@ -242,11 +248,11 @@
             <div class="admin-panel-card">
                 <div class="panel-header-row">
                     <div>
-                        <h3 class="panel-title">All Registered &amp; Logged-In Users (Click Any User to View Full Details &amp; UTRs)</h3>
-                        <p class="panel-desc">Cross-device live roster of every user, mobile number, bank &amp; IFSC, ATM autodebit, submitted UTRs, and wallet balance.</p>
+                        <h3 class="panel-title">User Roster &amp; Account Inspector</h3>
+                        <p class="panel-desc">Live user directory with bank/IFSC, ATM autodebit, submitted UTRs, and balances. Click any row for controls.</p>
                     </div>
                     <div class="panel-actions">
-                        <span class="stream-live-indicator"><span class="pulse-dot"></span> Live Cloud Sync</span>
+                        <span class="stream-live-indicator"><span class="pulse-dot"></span> Live Sync</span>
                     </div>
                 </div>
 
