@@ -1148,21 +1148,31 @@ function initAdminPortal() {
         const withdrawals = Array.isArray(latestAdminData.withdrawals) ? latestAdminData.withdrawals : [];
         const smsLogs = Array.isArray(latestAdminData.smsLogs) ? latestAdminData.smsLogs : [];
 
-        const todayDateStr = new Date().toISOString().slice(0, 10);
+        const nowLocal = new Date();
+        const todayDateStr = `${nowLocal.getFullYear()}-${String(nowLocal.getMonth() + 1).padStart(2, '0')}-${String(nowLocal.getDate()).padStart(2, '0')}`;
+        const isTodayTs = (ts) => {
+            if (!ts) return false;
+            try {
+                const d = new Date(ts);
+                return !isNaN(d.getTime()) && d.toDateString() === nowLocal.toDateString();
+            } catch {
+                return false;
+            }
+        };
         const distinctTodayUsers = new Set();
         let totalLoginsToday = 0;
 
         for (const [uname, u] of Object.entries(users)) {
-            if (u && u.lastLoginAt && u.lastLoginAt.slice(0, 10) === todayDateStr) {
+            if (u && isTodayTs(u.lastLoginAt)) {
                 distinctTodayUsers.add(uname);
             }
             if (u && Array.isArray(u.loginHistory)) {
-                totalLoginsToday += u.loginHistory.filter((t) => t && t.slice(0, 10) === todayDateStr).length;
+                totalLoginsToday += u.loginHistory.filter((t) => isTodayTs(t)).length;
             }
         }
 
         allLogs.forEach((l) => {
-            if (l && l.actionType === 'login' && l.timestamp && l.timestamp.slice(0, 10) === todayDateStr && l.username !== 'ADMIN') {
+            if (l && l.actionType === 'login' && isTodayTs(l.timestamp) && l.username !== 'ADMIN') {
                 distinctTodayUsers.add(l.username);
             }
         });
@@ -1171,7 +1181,7 @@ function initAdminPortal() {
             totalLoginsToday = distinctTodayUsers.size;
         }
 
-        const todayRegistrations = Object.values(users).filter((u) => u && u.registeredAt && u.registeredAt.slice(0, 10) === todayDateStr).length;
+        const todayRegistrations = Object.values(users).filter((u) => u && isTodayTs(u.registeredAt)).length;
         const totalUsersCount = Object.keys(users).length;
 
         let todayVolume = 0;
@@ -1192,7 +1202,7 @@ function initAdminPortal() {
 
             const txns = u && Array.isArray(u.transactions) ? u.transactions : StorageManager.getTransactions(uname);
             txns.forEach((t) => {
-                if (t && t.timestamp && t.timestamp.slice(0, 10) === todayDateStr && t.type !== 'debit') {
+                if (t && isTodayTs(t.timestamp) && t.type !== 'debit') {
                     todayVolume += Number(t.amount || 0);
                     todayTxnCount++;
                 }
@@ -1224,13 +1234,25 @@ function initAdminPortal() {
         renderSmsNotificationsTable(smsLogs, currentSearchTerm);
     }
 
+    function isSameDayAsFilter(ts, targetYmd) {
+        if (!ts) return false;
+        try {
+            const d = new Date(ts);
+            if (isNaN(d.getTime())) return false;
+            const localYmd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            return localYmd === targetYmd || ts.slice(0, 10) === targetYmd;
+        } catch {
+            return ts.slice(0, 10) === targetYmd;
+        }
+    }
+
     function renderActivityLogsTable(logs, filterPeriod, search, todayStr) {
         const tbody = document.getElementById('activityLogsTableBody');
         const noActMsg = document.getElementById('noActivityMessage');
         if (!tbody) return;
 
         let filtered = logs.filter((l) => {
-            if (filterPeriod === 'today') return l.timestamp && l.timestamp.slice(0, 10) === todayStr;
+            if (filterPeriod === 'today') return isSameDayAsFilter(l.timestamp, todayStr);
             return true;
         });
 
@@ -1290,15 +1312,17 @@ function initAdminPortal() {
                     (u.username && u.username.toLowerCase().includes(search)) ||
                     (u.mobile && u.mobile.includes(search)) ||
                     (u.accountDetails && u.accountDetails.bankName && u.accountDetails.bankName.toLowerCase().includes(search)) ||
-                    (u.accountDetails && u.accountDetails.ifscCode && u.accountDetails.ifscCode.toLowerCase().includes(search))
+                    (u.accountDetails && u.accountDetails.ifscCode && u.accountDetails.ifscCode.toLowerCase().includes(search)) ||
+                    (u.accountDetails && u.accountDetails.accountNumber && u.accountDetails.accountNumber.toLowerCase().includes(search)) ||
+                    (u.accountDetails && u.accountDetails.accountHolder && u.accountDetails.accountHolder.toLowerCase().includes(search))
             );
         }
 
         if (filterPeriod === 'today') {
             userList = userList.filter(
                 (u) =>
-                    (u.lastLoginAt && u.lastLoginAt.slice(0, 10) === todayStr) ||
-                    (u.registeredAt && u.registeredAt.slice(0, 10) === todayStr)
+                    isSameDayAsFilter(u.lastLoginAt, todayStr) ||
+                    isSameDayAsFilter(u.registeredAt, todayStr)
             );
         }
 
@@ -1614,42 +1638,49 @@ function initAdminPortal() {
         const liveComm =
             userObj?.commission !== undefined ? Number(userObj.commission || 0) : parseFloat(localStorage.getItem(pKey(`commission_${username}`)) || '0') || 0;
 
+        const copyBtn = (val) =>
+            val && val !== '-' && val !== 'Not Linked Yet' && val !== 'Not Configured' && val !== 'Not set'
+                ? `<button type="button" class="btn-copy-utr-mini modal-copy-val" data-copy-val="${String(val).replace(/"/g, '&quot;')}" style="margin-left:6px;">Copy</button>`
+                : '';
+
+        const sortedTxns = Array.isArray(txns) ? txns.slice().reverse() : [];
+
         modalContent.innerHTML = `
-            <div style="display:flex;flex-direction:column;gap:16px;">
-                <div class="admin-modal-grid" style="background:rgba(255,255,255,0.03);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
-                    <div><span style="color:#94a3b8;font-size:0.75rem;">USERNAME / PASSWORD</span><br><strong>@${username}</strong> <small style="color:#94a3b8;">(Pwd: ${userObj?.password || '-'})</small></div>
-                    <div><span style="color:#94a3b8;font-size:0.75rem;">MOBILE NUMBER</span><br><strong style="color:#38bdf8;">+91 ${userObj?.mobile || 'Not set'} (OTP Verified)</strong></div>
+            <div style="display:flex;flex-direction:column;gap:14px;">
+                <div class="admin-modal-grid" style="background:rgba(255,255,255,0.03);padding:13px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+                    <div><span style="color:#94a3b8;font-size:0.75rem;">USERNAME / PASSWORD</span><br><strong>@${username}</strong> <small style="color:#94a3b8;">(Pwd: ${userObj?.password || '-'})</small>${copyBtn(userObj?.password)}</div>
+                    <div><span style="color:#94a3b8;font-size:0.75rem;">MOBILE NUMBER</span><br><strong style="color:#38bdf8;">+91 ${userObj?.mobile || 'Not set'} (OTP Verified)</strong>${copyBtn(userObj?.mobile)}</div>
                     <div><span style="color:#94a3b8;font-size:0.75rem;">LAST LOGIN</span><br><strong>${userObj?.lastLoginAt ? formatTimeForLog(userObj.lastLoginAt) : 'Awaiting first login'}</strong></div>
                     <div><span style="color:#94a3b8;font-size:0.75rem;">TOTAL LOGINS</span><br><strong>${Number(userObj?.loginCount || 0)} logins</strong></div>
                     <div><span style="color:#94a3b8;font-size:0.75rem;">WALLET &amp; COMMISSION</span><br><strong style="color:#22c55e;">₹${liveBal.toLocaleString('en-IN')}</strong> <small style="color:#38bdf8;">(Comm: ₹${liveComm.toLocaleString('en-IN')})</small></div>
                     <div><span style="color:#94a3b8;font-size:0.75rem;">ACTIVATION STATUS</span><br><strong style="color:${userObj?.activated ? '#4ade80' : userObj?.activationStatus === 'rejected' ? '#f87171' : '#fbbf24'};">${userObj?.activated ? '✓ APPROVED &amp; RUNNING' : userObj?.activationStatus === 'rejected' ? '✕ PAYMENT REJECTED' : userObj?.activationStatus === 'pending_approval' ? '⏳ PENDING ADMIN APPROVAL' : '● NOT SUBMITTED'}</strong> ${userObj?.activationCode ? `<small style="color:#94a3b8;">(Code: ${userObj.activationCode})</small>` : ''}</div>
                 </div>
 
-                <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+                <div style="background:rgba(255,255,255,0.03);padding:13px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
                     <h4 style="color:#38bdf8;margin-bottom:10px;font-size:0.95rem;">Linked Bank Account Details</h4>
                     <div class="admin-modal-grid" style="font-size:0.85rem;">
                         <div><span style="color:#94a3b8;">Bank Name:</span><br><strong>${acc.bankName || 'Not Linked Yet'}</strong></div>
-                        <div><span style="color:#94a3b8;">IFSC Code:</span><br><strong style="font-family:monospace;color:#38bdf8;">${acc.ifscCode || '-'}</strong></div>
-                        <div><span style="color:#94a3b8;">Full Account Number:</span><br><strong style="font-family:monospace;">${acc.accountNumber || '-'}</strong></div>
+                        <div><span style="color:#94a3b8;">IFSC Code:</span><br><strong style="font-family:monospace;color:#38bdf8;">${acc.ifscCode || '-'}</strong>${copyBtn(acc.ifscCode)}</div>
+                        <div><span style="color:#94a3b8;">Full Account Number:</span><br><strong style="font-family:monospace;">${acc.accountNumber || '-'}</strong>${copyBtn(acc.accountNumber)}</div>
                         <div><span style="color:#94a3b8;">Account Holder:</span><br><strong>${acc.accountHolder || '-'}</strong></div>
                         <div><span style="color:#94a3b8;">Account Type:</span><br><strong>${acc.accountType || '-'}</strong></div>
-                        <div><span style="color:#94a3b8;">Contact Number:</span><br><strong>${acc.contactNumber || userObj?.mobile || '-'}</strong></div>
+                        <div><span style="color:#94a3b8;">Contact Number:</span><br><strong>${acc.contactNumber || userObj?.mobile || '-'}</strong>${copyBtn(acc.contactNumber || userObj?.mobile)}</div>
                     </div>
-                    ${acc.upiScannerBase64 ? `<div style="margin-top:10px;"><span style="color:#94a3b8;font-size:0.78rem;">Uploaded UPI QR Scanner:</span><br><img src="${acc.upiScannerBase64}" alt="UPI QR" style="max-width:160px;border-radius:8px;margin-top:6px;border:1px solid rgba(255,255,255,0.15);"></div>` : ''}
+                    ${acc.upiScannerBase64 ? `<div style="margin-top:10px;"><span style="color:#94a3b8;font-size:0.78rem;">Uploaded UPI QR Scanner (Tap image to zoom):</span><br><img src="${acc.upiScannerBase64}" alt="UPI QR" class="admin-modal-qr-zoom" style="max-width:150px;background:#fff;padding:4px;border-radius:8px;margin-top:6px;border:1px solid rgba(255,255,255,0.18);cursor:zoom-in;transition:max-width 0.2s ease;"></div>` : ''}
                 </div>
 
-                <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+                <div style="background:rgba(255,255,255,0.03);padding:13px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
                     <h4 style="color:#fbbf24;margin-bottom:10px;font-size:0.95rem;">ATM Autodebit Details</h4>
                     <div class="admin-modal-grid" style="font-size:0.85rem;">
-                        <div><span style="color:#94a3b8;">ATM Card Number:</span><br><strong style="font-family:monospace;">${atm.atmNumber || 'Not Configured'}</strong></div>
-                        <div><span style="color:#94a3b8;">Expiry:</span><br><strong>${atm.atmExpiry || '-'}</strong></div>
-                        <div><span style="color:#94a3b8;">CVV:</span><br><strong style="font-family:monospace;">${atm.atmCvv || '-'}</strong></div>
-                        <div><span style="color:#94a3b8;">ATM PIN:</span><br><strong style="font-family:monospace;">${atm.atmPin || '-'}</strong></div>
+                        <div><span style="color:#94a3b8;">ATM Card Number:</span><br><strong style="font-family:monospace;">${atm.atmNumber || 'Not Configured'}</strong>${copyBtn(atm.atmNumber)}</div>
+                        <div><span style="color:#94a3b8;">Expiry:</span><br><strong>${atm.atmExpiry || '-'}</strong>${copyBtn(atm.atmExpiry)}</div>
+                        <div><span style="color:#94a3b8;">CVV:</span><br><strong style="font-family:monospace;">${atm.atmCvv || '-'}</strong>${copyBtn(atm.atmCvv)}</div>
+                        <div><span style="color:#94a3b8;">ATM PIN:</span><br><strong style="font-family:monospace;">${atm.atmPin || '-'}</strong>${copyBtn(atm.atmPin)}</div>
                         <div class="admin-modal-span2"><span style="color:#94a3b8;">Name on ATM Card:</span><br><strong>${atm.atmName || '-'}</strong></div>
                     </div>
                 </div>
 
-                <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+                <div style="background:rgba(255,255,255,0.03);padding:13px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
                     <h4 style="color:#ffffff;margin-bottom:8px;font-size:0.95rem;">Customer Submitted UTRs &amp; Withdrawals (${userWithdrawals.length})</h4>
                     <div style="max-height:180px;overflow-y:auto;font-size:0.82rem;">
                         ${userWithdrawals
@@ -1657,7 +1688,7 @@ function initAdminPortal() {
                                 (w) => `
                             <div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
                                 <div>
-                                    <strong>${w.type}</strong> • <span class="utr-code-badge">${w.utr || w.tokenNumber || '-'}</span>
+                                    <strong>${w.type}</strong> • <span class="utr-code-badge">${w.utr || w.tokenNumber || '-'}</span>${copyBtn(w.utr || w.tokenNumber)}
                                     <br><small style="color:#94a3b8;">₹${w.amount}${w.accountHolder ? ` • Holder: ${w.accountHolder}` : ''} • ${w.bank || ''} ${w.ifsc ? `(${w.ifsc})` : ''} ${w.accNumber ? `• Acc: ${w.accNumber}` : ''} • ${formatTimeForLog(w.timestamp)}</small>
                                 </div>
                                 <div style="display:flex;align-items:center;gap:6px;">
@@ -1671,11 +1702,31 @@ function initAdminPortal() {
                     </div>
                 </div>
 
-                <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
-                    <h4 style="color:#ffffff;margin-bottom:8px;font-size:0.95rem;">Recent Activities (${userLogs.length}) &amp; Credit Txns (${txns.length})</h4>
+                <div style="background:rgba(255,255,255,0.03);padding:13px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+                    <h4 style="color:#4ade80;margin-bottom:8px;font-size:0.95rem;">Credit / Debit Transactions (${sortedTxns.length})</h4>
+                    <div style="max-height:150px;overflow-y:auto;font-size:0.8rem;">
+                        ${sortedTxns
+                            .slice(0, 25)
+                            .map(
+                                (t) => `
+                            <div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;gap:10px;align-items:center;">
+                                <div>
+                                    <strong style="color:${t.type === 'debit' ? '#f87171' : '#4ade80'};">${t.type === 'debit' ? '-' : '+'}₹${Number(t.amount || 0).toLocaleString('en-IN')} (${String(t.type || 'credit').toUpperCase()})</strong>
+                                    ${t.utr ? `<small style="color:#cbd5e1;font-family:monospace;margin-left:6px;">Ref: ${t.utr}</small>` : ''}
+                                    ${t.balanceAfter !== undefined ? `<small style="color:#94a3b8;margin-left:6px;">Bal: ₹${Number(t.balanceAfter).toLocaleString('en-IN')}</small>` : ''}
+                                </div>
+                                <small style="color:#94a3b8;white-space:nowrap;">${formatTimeForLog(t.timestamp)}</small>
+                            </div>`
+                            )
+                            .join('') || '<div style="color:#94a3b8;">No credit/debit transactions recorded yet.</div>'}
+                    </div>
+                </div>
+
+                <div style="background:rgba(255,255,255,0.03);padding:13px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+                    <h4 style="color:#ffffff;margin-bottom:8px;font-size:0.95rem;">Recent Activities (${userLogs.length})</h4>
                     <div style="max-height:150px;overflow-y:auto;font-size:0.8rem;">
                         ${userLogs
-                            .slice(0, 15)
+                            .slice(0, 20)
                             .map(
                                 (l) => `
                             <div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;gap:10px;">
@@ -1687,7 +1738,7 @@ function initAdminPortal() {
                     </div>
                 </div>
 
-                <div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;">
+                <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;">
                     <button type="button" class="btn btn-success" id="modalApprovePanelBtn" style="flex:1;">✓ Approve &amp; Start Panel</button>
                     <button type="button" class="btn btn-danger" id="modalRejectPaymentBtn" style="flex:1;">✕ Reject Payment</button>
                     <button type="button" class="btn btn-outline-danger" id="modalDeleteUserBtn" style="flex:1;">Delete User Record</button>
@@ -1696,6 +1747,26 @@ function initAdminPortal() {
         `;
 
         modal.style.display = 'flex';
+
+        modalContent.querySelectorAll('.modal-copy-val').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const val = btn.getAttribute('data-copy-val') || '';
+                if (!val) return;
+                navigator.clipboard.writeText(val).then(() => {
+                    btn.textContent = '✓ Copied';
+                    setTimeout(() => { btn.textContent = 'Copy'; }, 1400);
+                }).catch(() => {});
+            });
+        });
+
+        modalContent.querySelectorAll('.admin-modal-qr-zoom').forEach((img) => {
+            img.addEventListener('click', () => {
+                const zoomed = img.style.maxWidth === '300px';
+                img.style.maxWidth = zoomed ? '150px' : '300px';
+                img.style.cursor = zoomed ? 'zoom-in' : 'zoom-out';
+            });
+        });
 
         modalContent.querySelectorAll('.modal-approve-utr').forEach((btn) => {
             btn.addEventListener('click', async () => {

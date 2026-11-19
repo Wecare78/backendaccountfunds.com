@@ -1,3 +1,18 @@
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import {
+  getFirestore,
+  collection,
+  doc,
+  getDoc,
+  getDocFromServer,
+  getDocs,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  query,
+  where,
+  onSnapshot,
+} from 'firebase/firestore';
 import DEFAULT_CLOUD_CONFIG from './cloud-config.js';
 
 const NS = 'af_p2_';
@@ -349,6 +364,21 @@ function handleFirestoreError(error, operationType, path) {
   throw new Error(serialized);
 }
 
+const BUNDLED_FS_MOD = {
+  getFirestore,
+  collection,
+  doc,
+  getDoc,
+  getDocFromServer,
+  getDocs,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  query,
+  where,
+  onSnapshot,
+};
+
 async function getFirestoreContext() {
   const cfg = getActiveCloudConfig();
   if (cfg.mode !== 'firestore' || !cfg.firestoreConfig || !cfg.firestoreConfig.projectId) {
@@ -358,20 +388,15 @@ async function getFirestoreContext() {
   if (!firestoreRuntimePromise) {
     firestoreRuntimePromise = (async () => {
       try {
-        const [appMod, fsMod] = await Promise.all([
-          import(/* @vite-ignore */ 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js'),
-          import(/* @vite-ignore */ 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js'),
-        ]);
         const fbCfg = cfg.firestoreConfig;
-        const app = appMod.getApps().length ? appMod.getApp() : appMod.initializeApp(fbCfg);
+        const app = getApps().length ? getApp() : initializeApp(fbCfg);
         const db = fbCfg.firestoreDatabaseId
-          ? fsMod.getFirestore(app, fbCfg.firestoreDatabaseId)
-          : fsMod.getFirestore(app);
+          ? getFirestore(app, fbCfg.firestoreDatabaseId)
+          : getFirestore(app);
 
-        firestoreContext = { app, db, fs: fsMod };
+        firestoreContext = { app, db, fs: BUNDLED_FS_MOD };
 
-        // Validate connection to Firestore asynchronously so listeners/writes start immediately
-        void fsMod.getDocFromServer(fsMod.doc(db, 'test', 'connection')).catch((err) => {
+        void getDocFromServer(doc(db, 'test', 'connection')).catch((err) => {
           if (err instanceof Error && err.message.includes('the client is offline')) {
             console.error('Please check your Firebase configuration.');
           }
@@ -414,11 +439,22 @@ function sanitizeAccountDetails(details) {
   }
   if (details?.upiScannerBase64 !== undefined) {
     sanitized.upiScannerBase64 =
-      details.upiScannerBase64 && String(details.upiScannerBase64).length <= 600000
+      details.upiScannerBase64 && String(details.upiScannerBase64).length <= 650000
         ? String(details.upiScannerBase64)
         : null;
   }
   return sanitized;
+}
+
+function mergeAccountDetails(prevAcc, nextAcc) {
+  if (!prevAcc && !nextAcc) return null;
+  if (!prevAcc) return nextAcc;
+  if (!nextAcc) return prevAcc;
+  return {
+    ...prevAcc,
+    ...nextAcc,
+    upiScannerBase64: nextAcc.upiScannerBase64 || prevAcc.upiScannerBase64 || null,
+  };
 }
 
 function sanitizeAutodebitDetails(details) {
@@ -1114,12 +1150,28 @@ const store = {
         users[res.data.user.username] = res.data.user;
         saveLocalUsersMap(users);
         syncUserStatsToLocalKeys(res.data.user);
+        const loginAct = pushLocalActivity(
+          res.data.user.username,
+          'login',
+          'User logged in successfully (Session active)',
+          'auth',
+          'success',
+          res.data.user.mobile
+        );
         broadcastSyncEvent('login');
-        void fsUpsertUser(res.data.user.username, {
-          lastLoginAt: res.data.user.lastLoginAt,
-          loginCount: res.data.user.loginCount,
-          loginHistory: res.data.user.loginHistory,
-        }).catch(() => {});
+        const fsSyncTasks = [
+          fsUpsertUser(res.data.user.username, {
+            lastLoginAt: res.data.user.lastLoginAt,
+            loginCount: res.data.user.loginCount,
+            loginHistory: res.data.user.loginHistory,
+          }).catch((err) => console.error('Firestore loginUser user upsert warning:', err)),
+        ];
+        if (loginAct) {
+          fsSyncTasks.push(
+            fsCreateActivity(loginAct).catch((err) => console.error('Firestore loginUser activity warning:', err))
+          );
+        }
+        await Promise.allSettled(fsSyncTasks);
         return {
           success: true,
           username: res.data.username || res.data.user.username,
@@ -1265,11 +1317,16 @@ const store = {
       for (const c of candidates.slice(1)) {
         const prevTxns = Array.isArray(merged.transactions) ? merged.transactions : [];
         const nextTxns = Array.isArray(c.transactions) ? c.transactions : [];
+        const prevHist = Array.isArray(merged.loginHistory) ? merged.loginHistory : [];
+        const nextHist = Array.isArray(c.loginHistory) ? c.loginHistory : [];
         merged = {
           ...merged,
           ...c,
-          accountDetails: c.accountDetails || merged.accountDetails || null,
+          mobile: c.mobile || merged.mobile || '',
+          accountDetails: mergeAccountDetails(merged.accountDetails, c.accountDetails),
           autodebitDetails: c.autodebitDetails || merged.autodebitDetails || null,
+          loginCount: Math.max(Math.floor(safeNum(merged.loginCount)), Math.floor(safeNum(c.loginCount))),
+          loginHistory: nextHist.length >= prevHist.length ? nextHist : prevHist,
           transactions: nextTxns.length >= prevTxns.length ? nextTxns : prevTxns,
           balance: Math.max(safeNum(merged.balance), safeNum(c.balance)) === 0 && (c.balance === 0 || merged.balance === 0)
             ? safeNum(c.balance)
@@ -1526,17 +1583,37 @@ const store = {
   },
 
   async saveAccountDetails(u, details) {
-    const sanitized = sanitizeAccountDetails(details);
     const users = getLocalUsersMap();
+    const prevQr = users[u]?.accountDetails?.upiScannerBase64 || null;
+    const sanitized = sanitizeAccountDetails({
+      ...(details || {}),
+      upiScannerBase64: details?.upiScannerBase64 || prevQr || null,
+    });
+    const cleanContact = String(sanitized.contactNumber || '').replace(/\D/g, '').slice(-10);
     if (users[u]) {
       users[u].accountDetails = sanitized;
+      if (!users[u].mobile && cleanContact) users[u].mobile = cleanContact;
       saveLocalUsersMap(users);
     }
+
+    const last4 = String(sanitized.accountNumber || '0000').slice(-4).padStart(4, '0');
+    const act = pushLocalActivity(
+      u,
+      'bank_details',
+      `Configured bank: ${sanitized.bankName} (IFSC: ${sanitized.ifscCode}, Acc: XXXX${last4}, Holder: ${sanitized.accountHolder})`,
+      'banking',
+      'success',
+      cleanContact
+    );
     broadcastSyncEvent('bank_details');
 
     const cfg = getActiveCloudConfig();
+    const userPatch = {
+      accountDetails: sanitized,
+      ...(cleanContact && !users[u]?.mobile ? { mobile: cleanContact } : {}),
+    };
     const tasks = [
-      fsUpsertUser(u, { accountDetails: sanitized }).catch((err) => {
+      fsUpsertUser(u, userPatch).catch((err) => {
         console.error('Firestore saveAccountDetails error:', err);
       }),
       apiJson('/api/users/bank-details', {
@@ -1544,8 +1621,16 @@ const store = {
         body: JSON.stringify({ username: u, details: sanitized }),
       }),
     ];
+    if (act) {
+      tasks.push(
+        fsCreateActivity(act).catch((err) => {
+          console.error('Firestore bank_details activity error:', err);
+        })
+      );
+    }
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', { accountDetails: sanitized }));
+      tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', userPatch));
+      if (act) tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
     }
     await Promise.allSettled(tasks);
     broadcastSyncEvent('bank_details');
@@ -1559,6 +1644,15 @@ const store = {
       users[u].autodebitDetails = sanitized;
       saveLocalUsersMap(users);
     }
+
+    const cardLast4 = String(sanitized.atmNumber || '').slice(-4).padStart(4, '0');
+    const act = pushLocalActivity(
+      u,
+      'autodebit',
+      `Configured ATM autodebit verification (Card: XXXX${cardLast4}, Exp: ${sanitized.atmExpiry}, Name: ${sanitized.atmName})`,
+      'atm',
+      'success'
+    );
     broadcastSyncEvent('autodebit');
 
     const cfg = getActiveCloudConfig();
@@ -1571,8 +1665,16 @@ const store = {
         body: JSON.stringify({ username: u, details: sanitized }),
       }),
     ];
+    if (act) {
+      tasks.push(
+        fsCreateActivity(act).catch((err) => {
+          console.error('Firestore autodebit activity error:', err);
+        })
+      );
+    }
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
       tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', { autodebitDetails: sanitized }));
+      if (act) tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
     }
     await Promise.allSettled(tasks);
     broadcastSyncEvent('autodebit');
@@ -1586,6 +1688,11 @@ const store = {
     const entry = sanitizeUtrEntry(payload.record || {});
     entry.username = uname;
 
+    const actionType = String(payload?.actionType || '').toLowerCase();
+    const typeLower = String(entry.type || '').toLowerCase();
+    const isBonusWithdraw = actionType === 'bonus_withdraw' || typeLower.includes('bonus');
+    const shouldSetPending = !isBonusWithdraw;
+
     const utrs = getLocalUtrs();
     const existingIdx = utrs.findIndex((x) => x && x.id === entry.id);
     if (existingIdx >= 0) utrs[existingIdx] = entry;
@@ -1593,21 +1700,21 @@ const store = {
     saveLocalUtrs(utrs);
 
     const users = getLocalUsersMap();
-    if (users[uname]) {
+    if (shouldSetPending && users[uname]) {
       users[uname].activated = false;
       users[uname].activationStatus = 'pending_approval';
       users[uname].rejectionMessage = '';
       if (payload.activationCode) users[uname].activationCode = String(payload.activationCode).slice(0, 32);
       saveLocalUsersMap(users);
     }
-    broadcastSyncEvent('utr_submitted');
+    broadcastSyncEvent(isBonusWithdraw ? 'bonus_withdraw' : 'utr_submitted');
 
     const act = pushLocalActivity(
       uname,
       payload.actionType || 'activation_utr',
       payload.activityText || `Submitted ${entry.type}: ${entry.utr || entry.tokenNumber} (₹${entry.amount})`,
-      'payment',
-      'info'
+      isBonusWithdraw ? 'bonus' : 'payment',
+      isBonusWithdraw ? 'success' : 'info'
     );
 
     const fsCtx = await getFirestoreContext();
@@ -1620,17 +1727,25 @@ const store = {
           console.error('Firestore submitUtrRecord UTR error:', err);
         })
       );
-      tasks.push(
-        fsUpsertUser(uname, {
-          activated: false,
-          activationStatus: 'pending_approval',
-          rejectionMessage: '',
-          ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
-        }).catch((err) => {
-          console.error('Firestore submitUtrRecord user error:', err);
-        })
-      );
-      if (act) tasks.push(fsCreateActivity(act).catch(() => {}));
+      if (shouldSetPending) {
+        tasks.push(
+          fsUpsertUser(uname, {
+            activated: false,
+            activationStatus: 'pending_approval',
+            rejectionMessage: '',
+            ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
+          }).catch((err) => {
+            console.error('Firestore submitUtrRecord user error:', err);
+          })
+        );
+      }
+      if (act) {
+        tasks.push(
+          fsCreateActivity(act).catch((err) => {
+            console.error('Firestore submitUtrRecord activity error:', err);
+          })
+        );
+      }
     }
 
     tasks.push(
@@ -1648,19 +1763,21 @@ const store = {
 
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
       tasks.push(rtdbFetch(`utrs/${encodeURIComponent(entry.id)}`, 'PUT', entry));
-      tasks.push(
-        rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
-          activated: false,
-          activationStatus: 'pending_approval',
-          rejectionMessage: '',
-          ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
-        })
-      );
+      if (shouldSetPending) {
+        tasks.push(
+          rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
+            activated: false,
+            activationStatus: 'pending_approval',
+            rejectionMessage: '',
+            ...(payload.activationCode ? { activationCode: String(payload.activationCode).slice(0, 32) } : {}),
+          })
+        );
+      }
       if (act) tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
     }
 
     await Promise.allSettled(tasks);
-    broadcastSyncEvent('utr_submitted');
+    broadcastSyncEvent(isBonusWithdraw ? 'bonus_withdraw' : 'utr_submitted');
     return entry;
   },
 
@@ -1748,6 +1865,20 @@ const store = {
         }
       : null;
 
+    const verb = txnType === 'debit' ? 'Auto-debited' : 'Auto-credited';
+    const prep = txnType === 'debit' ? 'from' : 'to';
+    const last4 = String(smsEntry?.accountNumber || users[uname]?.accountDetails?.accountNumber || '0000')
+      .replace(/\s+/g, '')
+      .slice(-4)
+      .padStart(4, '0');
+    const act = pushLocalActivity(
+      uname,
+      txnType === 'debit' ? 'debit_transaction' : 'credit_transaction',
+      `${verb} ₹${amountNum.toLocaleString('en-IN')} ${prep} ${smsEntry?.bankName || 'Linked Bank'} (XXXX${last4}) • Ref: ${txnEntry.utr || txnEntry.id}`,
+      txnType === 'debit' ? 'debit' : 'credit',
+      'success'
+    );
+
     broadcastSyncEvent('transaction');
 
     const cfg = getActiveCloudConfig();
@@ -1756,13 +1887,28 @@ const store = {
         balance: safeNum(payload.balance),
         commission: safeNum(payload.commission),
         transactions: nextTxns,
-      }).catch(() => {}),
+      }).catch((err) => {
+        console.error('Firestore recordTransaction user error:', err);
+      }),
       apiJson('/api/users/transaction', {
         method: 'POST',
         body: JSON.stringify(payload),
       }),
     ];
-    if (smsEntry) tasks.push(fsCreateSms(smsEntry).catch(() => {}));
+    if (smsEntry) {
+      tasks.push(
+        fsCreateSms(smsEntry).catch((err) => {
+          console.error('Firestore recordTransaction sms error:', err);
+        })
+      );
+    }
+    if (act) {
+      tasks.push(
+        fsCreateActivity(act).catch((err) => {
+          console.error('Firestore recordTransaction activity error:', err);
+        })
+      );
+    }
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl && users[uname]) {
       tasks.push(
         rtdbFetch(`users/${encodeURIComponent(toDocId(uname))}`, 'PATCH', {
@@ -1773,6 +1919,9 @@ const store = {
       );
       if (smsEntry) {
         tasks.push(rtdbFetch(`smsLogs/${encodeURIComponent(smsEntry.id)}`, 'PUT', smsEntry));
+      }
+      if (act) {
+        tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
       }
     }
     await Promise.allSettled(tasks);
@@ -1792,6 +1941,13 @@ const store = {
       users[u].transactions = [];
       saveLocalUsersMap(users);
     }
+    const act = pushLocalActivity(
+      u,
+      'bank_removed',
+      'User clicked Remove Bank Account. Autodebit and running account disabled.',
+      'security',
+      'warning'
+    );
     broadcastSyncEvent('bank_removed');
 
     const resetPatch = {
@@ -1806,14 +1962,24 @@ const store = {
     };
     const cfg = getActiveCloudConfig();
     const tasks = [
-      fsUpsertUser(u, resetPatch).catch(() => {}),
+      fsUpsertUser(u, resetPatch).catch((err) => {
+        console.error('Firestore removeBankData error:', err);
+      }),
       apiJson('/api/users/remove-bank', {
         method: 'POST',
         body: JSON.stringify({ username: u }),
       }),
     ];
+    if (act) {
+      tasks.push(
+        fsCreateActivity(act).catch((err) => {
+          console.error('Firestore removeBankData activity error:', err);
+        })
+      );
+    }
     if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
       tasks.push(rtdbFetch(`users/${encodeURIComponent(toDocId(u))}`, 'PATCH', resetPatch));
+      if (act) tasks.push(rtdbFetch(`activityLogs/${encodeURIComponent(act.id)}`, 'PUT', act));
     }
     await Promise.allSettled(tasks);
     broadcastSyncEvent('bank_removed');
@@ -1932,6 +2098,8 @@ const store = {
           }
           const prevTxns = Array.isArray(prev.transactions) ? prev.transactions : [];
           const nextTxns = Array.isArray(uObj.transactions) ? uObj.transactions : [];
+          const prevHist = Array.isArray(prev.loginHistory) ? prev.loginHistory : [];
+          const nextHist = Array.isArray(uObj.loginHistory) ? uObj.loginHistory : [];
           const prevTime = new Date(prev.lastLoginAt || prev.registeredAt || 0).getTime();
           const nextTime = new Date(uObj.lastLoginAt || uObj.registeredAt || 0).getTime();
           const preferNextStatus =
@@ -1940,12 +2108,20 @@ const store = {
             (prev.activationStatus !== 'approved' && uObj.activationStatus === 'pending_approval') ||
             nextTime >= prevTime;
 
+          const useNextTxns = nextTxns.length >= prevTxns.length;
+
           mergedUsers[uname] = {
             ...prev,
             ...uObj,
-            accountDetails: uObj.accountDetails || prev.accountDetails || null,
+            mobile: uObj.mobile || prev.mobile || '',
+            password: uObj.password || prev.password || '',
+            loginCount: Math.max(Math.floor(safeNum(prev.loginCount)), Math.floor(safeNum(uObj.loginCount))),
+            loginHistory: nextHist.length >= prevHist.length ? nextHist : prevHist,
+            accountDetails: mergeAccountDetails(prev.accountDetails, uObj.accountDetails),
             autodebitDetails: uObj.autodebitDetails || prev.autodebitDetails || null,
-            transactions: nextTxns.length >= prevTxns.length ? nextTxns : prevTxns,
+            transactions: useNextTxns ? nextTxns : prevTxns,
+            balance: useNextTxns ? safeNum(uObj.balance) : safeNum(prev.balance),
+            commission: useNextTxns ? safeNum(uObj.commission) : safeNum(prev.commission),
             activated: preferNextStatus ? Boolean(uObj.activated) : Boolean(prev.activated),
             activationStatus: preferNextStatus
               ? (uObj.activationStatus || (uObj.activated ? 'approved' : 'not_submitted'))
@@ -2085,7 +2261,7 @@ const store = {
         sseListeners.add(sseHandler);
       }
 
-      if (!ctx && (hasBackend || (cfg.mode === 'rtdb' && cfg.rtdbUrl))) {
+      if (hasBackend || (cfg.mode === 'rtdb' && cfg.rtdbUrl)) {
         const tick = async () => {
           if (stopped) return;
           if (hasBackend) {
@@ -2102,7 +2278,7 @@ const store = {
           }
         };
         void tick();
-        pollTimer = setInterval(() => void tick(), 2000);
+        pollTimer = setInterval(() => void tick(), ctx ? 4500 : 1800);
       }
     };
 
