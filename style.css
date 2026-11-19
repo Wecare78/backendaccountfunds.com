@@ -4229,6 +4229,65 @@ select:focus-visible {
 }
 
 @media (max-width: 480px) {
+    .admin-container {
+        margin-top: 8px;
+        gap: 10px;
+    }
+
+    .admin-header {
+        padding: 12px 14px;
+        gap: 10px;
+    }
+
+    .admin-title {
+        font-size: 1.08rem;
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+
+    .admin-toolbar {
+        padding: 10px 12px;
+        gap: 8px;
+    }
+
+    .admin-metrics-grid {
+        margin-top: -6px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+    }
+
+    .admin-metric-card {
+        padding: 10px 11px;
+        gap: 9px;
+    }
+
+    .admin-metric-card:last-child {
+        grid-column: 1 / -1;
+    }
+
+    .admin-metric-card .metric-icon {
+        width: 32px;
+        height: 32px;
+        font-size: 1.05rem;
+    }
+
+    .admin-metric-card .metric-title {
+        font-size: 0.65rem;
+    }
+
+    .admin-metric-card .metric-val {
+        font-size: 1.18rem;
+    }
+
+    .admin-metric-card .metric-sub-pill {
+        font-size: 0.62rem;
+        padding: 1px 5px;
+    }
+
+    .admin-metric-card .metric-desc {
+        font-size: 0.66rem;
+    }
+
     .verified-receipt-card,
     .utr-verify-tracker {
         padding: 20px 14px;

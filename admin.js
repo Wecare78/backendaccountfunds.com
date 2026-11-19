@@ -1023,17 +1023,44 @@ function initAdminPortal() {
 
     if (refreshBtn) {
         refreshBtn.addEventListener('click', async () => {
-            stopAdminFirestoreSubscription();
-            await startAdminFirestoreSubscription();
-            showAdminToast('✓ Live database & audit logs synced');
+            if (refreshBtn.disabled) return;
+            refreshBtn.disabled = true;
+            const labelSpan = refreshBtn.querySelector('span');
+            const prevLabel = labelSpan ? labelSpan.textContent : '🔄 Refresh';
+            if (labelSpan) labelSpan.textContent = '⏳ Syncing...';
+            try {
+                const fb = await getFirebaseStore();
+                if (!unsubscribeAdminFirestore) {
+                    await startAdminFirestoreSubscription();
+                }
+                if (fb && typeof fb.forceSyncAdminDashboard === 'function') {
+                    const res = await fb.forceSyncAdminDashboard();
+                    if (res && res.ok) {
+                        showAdminToast(`✓ Cloud Synced (${res.usersCount} users, ${res.utrsCount} UTRs)`);
+                    } else {
+                        showAdminToast('⚠ Offline / Reconnecting — showing latest cached data');
+                    }
+                } else {
+                    stopAdminFirestoreSubscription();
+                    await startAdminFirestoreSubscription();
+                    showAdminToast('✓ Live database & audit logs synced');
+                }
+            } finally {
+                if (labelSpan) labelSpan.textContent = prevLabel;
+                refreshBtn.disabled = false;
+            }
         });
     }
 
     if (clearLogsBtn) {
         clearLogsBtn.addEventListener('click', async () => {
+            if (latestAdminData) {
+                latestAdminData.activityLogs = [];
+                renderAdminDashboard();
+            }
+            StorageManager.clearActivityLogs();
             const fb = await getFirebaseStore();
             if (fb) await fb.adminClearLogs();
-            StorageManager.clearActivityLogs();
             showAdminToast('✓ Activity audit logs cleared');
         });
     }
@@ -1068,13 +1095,24 @@ function initAdminPortal() {
         const fb = await getFirebaseStore();
         if (!fb || typeof fb.getSyncModeInfo !== 'function') return;
         const info = await fb.getSyncModeInfo();
-        if (adminSyncModeLabel) adminSyncModeLabel.textContent = info.label || 'Cloud Firestore Live Sync';
-        if (cloudSyncCurrentModeText) cloudSyncCurrentModeText.textContent = info.label || 'Cloud Firestore Live Sync';
+        const liveStatus = typeof fb.getSyncStatus === 'function' ? fb.getSyncStatus() : null;
+        const badgeLabel = (liveStatus && liveStatus.label) || info.label || 'Cloud Firestore Live Sync';
+        if (adminSyncModeLabel) adminSyncModeLabel.textContent = badgeLabel;
+        if (cloudSyncCurrentModeText) cloudSyncCurrentModeText.textContent = info.label || badgeLabel;
         if (cloudSyncRtdbInput && info.rtdbUrl && !cloudSyncRtdbInput.value) {
             cloudSyncRtdbInput.value = info.rtdbUrl;
         }
     }
     void refreshSyncModeBadge();
+    void getFirebaseStore().then((fb) => {
+        if (fb && typeof fb.subscribeSyncStatus === 'function') {
+            fb.subscribeSyncStatus((st) => {
+                if (adminSyncModeLabel && st && st.label) {
+                    adminSyncModeLabel.textContent = st.label;
+                }
+            });
+        }
+    });
 
     if (adminCloudSyncBtn && adminCloudSyncModal) {
         adminCloudSyncBtn.addEventListener('click', async () => {

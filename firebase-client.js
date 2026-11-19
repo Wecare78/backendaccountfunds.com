@@ -1,18 +1,3 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import {
-  getFirestore,
-  collection,
-  doc,
-  getDoc,
-  getDocFromServer,
-  getDocs,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  query,
-  where,
-  onSnapshot,
-} from 'firebase/firestore';
 import DEFAULT_CLOUD_CONFIG from './cloud-config.js';
 
 const NS = 'af_p2_';
@@ -250,6 +235,24 @@ function getActiveCloudConfig() {
 
 let backendDetectPromise = null;
 let backendAvailable = null;
+let sseSource = null;
+let sseErrorCount = 0;
+const sseListeners = new Set();
+
+function closeServerSse() {
+  if (sseSource) {
+    try {
+      sseSource.close();
+    } catch {}
+    sseSource = null;
+  }
+  sseErrorCount = 0;
+}
+
+function markExpressBackendDown() {
+  backendAvailable = false;
+  closeServerSse();
+}
 
 async function isExpressBackendAvailable() {
   if (backendAvailable !== null) return backendAvailable;
@@ -261,7 +264,7 @@ async function isExpressBackendAvailable() {
     backendDetectPromise = (async () => {
       try {
         const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        const timer = ctrl ? setTimeout(() => ctrl.abort(), 1200) : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), 700) : null;
         const res = await fetch('/api/health', {
           method: 'GET',
           signal: ctrl ? ctrl.signal : undefined,
@@ -281,14 +284,17 @@ async function isExpressBackendAvailable() {
   return backendDetectPromise;
 }
 
-let sseSource = null;
-const sseListeners = new Set();
-
 function ensureServerSseConnected() {
-  if (typeof window === 'undefined' || typeof EventSource === 'undefined' || sseSource) return;
+  if (typeof window === 'undefined' || typeof EventSource === 'undefined' || sseSource || backendAvailable !== true) {
+    return;
+  }
   try {
     sseSource = new EventSource('/api/events');
+    sseSource.addEventListener('connected', () => {
+      sseErrorCount = 0;
+    });
     sseSource.addEventListener('sync', (evt) => {
+      sseErrorCount = 0;
       let detail = { type: 'sync' };
       try {
         detail = evt && evt.data ? JSON.parse(evt.data) : detail;
@@ -300,7 +306,11 @@ function ensureServerSseConnected() {
       });
     });
     sseSource.onerror = () => {
-      // Browser EventSource reconnects automatically using server retry interval
+      sseErrorCount += 1;
+      // Stop reconnect loops cleanly if AI Studio / Express server shuts down
+      if (sseErrorCount >= 2) {
+        markExpressBackendDown();
+      }
     };
   } catch {}
 }
@@ -323,20 +333,51 @@ async function apiJson(url, options = {}) {
   const hasBackend = await isExpressBackendAvailable();
   if (!hasBackend) return { ok: false, status: 0, data: null };
   ensureServerSseConnected();
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 3500;
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
     const res = await fetch(url, {
       ...options,
+      signal: ctrl ? ctrl.signal : options.signal,
       headers: {
         'Content-Type': 'application/json',
         ...(options.headers || {}),
       },
     });
+    if (timer) clearTimeout(timer);
     const ct = res.headers.get('content-type') || '';
-    const data = ct.includes('application/json') ? await res.json() : null;
+    if (!ct.includes('application/json')) {
+      if (res.status >= 500 || res.status === 404) markExpressBackendDown();
+      return { ok: false, status: res.status, data: null };
+    }
+    const data = await res.json();
     return { ok: res.ok, status: res.status, data };
   } catch {
+    if (timer) clearTimeout(timer);
+    markExpressBackendDown();
     return { ok: false, status: 0, data: null };
   }
+}
+
+// --------------------------------------------
+// Sync Status Telemetry (For Independent Admin UI Indicator)
+// --------------------------------------------
+const syncStatusListeners = new Set();
+let syncStatusState = {
+  status: 'connecting', // 'connecting' | 'connected' | 'reconnecting' | 'offline' | 'rtdb'
+  label: 'Cloud Firestore Live Sync',
+  lastSyncAt: null,
+  error: '',
+};
+
+function emitSyncStatus(next) {
+  syncStatusState = { ...syncStatusState, ...(next || {}) };
+  syncStatusListeners.forEach((fn) => {
+    try {
+      fn({ ...syncStatusState });
+    } catch {}
+  });
 }
 
 // --------------------------------------------
@@ -345,8 +386,14 @@ async function apiJson(url, options = {}) {
 let firestoreRuntimePromise = null;
 let firestoreContext = null; // { db, fs, app }
 
-function handleFirestoreError(error, operationType, path) {
-  const errInfo = {
+function isFirestorePermissionError(error) {
+  const code = String(error?.code || '').toLowerCase();
+  const msg = String(error?.message || error || '').toLowerCase();
+  return code === 'permission-denied' || msg.includes('missing or insufficient permissions') || msg.includes('permission_denied');
+}
+
+function buildFirestoreErrorInfo(error, operationType, path) {
+  return {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
       userId: null,
@@ -359,25 +406,79 @@ function handleFirestoreError(error, operationType, path) {
     operationType,
     path,
   };
-  const serialized = JSON.stringify(errInfo);
+}
+
+function handleFirestoreError(error, operationType, path) {
+  const serialized = JSON.stringify(buildFirestoreErrorInfo(error, operationType, path));
   console.error('Firestore Error: ', serialized);
   throw new Error(serialized);
 }
 
-const BUNDLED_FS_MOD = {
-  getFirestore,
-  collection,
-  doc,
-  getDoc,
-  getDocFromServer,
-  getDocs,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  query,
-  where,
-  onSnapshot,
-};
+function handleSnapshotError(error, operationType, path, onRecoverableError) {
+  if (isFirestorePermissionError(error)) {
+    const serialized = JSON.stringify(buildFirestoreErrorInfo(error, operationType, path));
+    console.error('Firestore Error: ', serialized);
+    emitSyncStatus({ status: 'offline', label: 'Firestore Permission Error (Local Cache Active)', error: serialized });
+    if (typeof onRecoverableError === 'function') onRecoverableError(error);
+    throw new Error(serialized);
+  }
+  console.warn(`Firestore snapshot stream interrupted on ${path}, switching to fallback sync:`, error?.message || error);
+  emitSyncStatus({
+    status: 'reconnecting',
+    label: 'Reconnecting Cloud Sync (Polling Active)',
+    error: error?.message || String(error || ''),
+  });
+  if (typeof onRecoverableError === 'function') onRecoverableError(error);
+}
+
+const FIREBASE_CDN_VERSION = '11.6.1';
+const FIREBASE_CDN_BASES = [
+  `https://www.gstatic.com/firebasejs/${FIREBASE_CDN_VERSION}`,
+  `https://cdn.jsdelivr.net/npm/firebase@${FIREBASE_CDN_VERSION}`,
+];
+
+function importWithTimeout(url, timeoutMs = 6500) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`CDN import timeout: ${url}`));
+      }
+    }, timeoutMs);
+    import(/* @vite-ignore */ url)
+      .then((mod) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(mod);
+        }
+      })
+      .catch((err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+  });
+}
+
+async function loadFirebaseModulesFromCdn() {
+  let lastErr = null;
+  for (const base of FIREBASE_CDN_BASES) {
+    try {
+      const [appMod, fsMod] = await Promise.all([
+        importWithTimeout(`${base}/firebase-app.js`, 6500),
+        importWithTimeout(`${base}/firebase-firestore.js`, 6500),
+      ]);
+      return [appMod, fsMod];
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Unable to load Firebase SDK modules from CDN');
+}
 
 async function getFirestoreContext() {
   const cfg = getActiveCloudConfig();
@@ -388,17 +489,77 @@ async function getFirestoreContext() {
   if (!firestoreRuntimePromise) {
     firestoreRuntimePromise = (async () => {
       try {
+        const [appMod, fsMod] = await loadFirebaseModulesFromCdn();
+
+        const { initializeApp, getApps, getApp } = appMod;
+        const {
+          getFirestore,
+          initializeFirestore,
+          collection,
+          doc,
+          getDoc,
+          getDocFromServer,
+          getDocs,
+          getDocsFromServer,
+          setDoc,
+          updateDoc,
+          deleteDoc,
+          query,
+          where,
+          onSnapshot,
+        } = fsMod;
+
         const fbCfg = cfg.firestoreConfig;
         const app = getApps().length ? getApp() : initializeApp(fbCfg);
-        const db = fbCfg.firestoreDatabaseId
-          ? getFirestore(app, fbCfg.firestoreDatabaseId)
-          : getFirestore(app);
+        let db = null;
+        if (typeof initializeFirestore === 'function') {
+          try {
+            db = fbCfg.firestoreDatabaseId
+              ? initializeFirestore(app, { experimentalAutoDetectLongPolling: true }, fbCfg.firestoreDatabaseId)
+              : initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+          } catch {
+            db = fbCfg.firestoreDatabaseId
+              ? getFirestore(app, fbCfg.firestoreDatabaseId)
+              : getFirestore(app);
+          }
+        } else {
+          db = fbCfg.firestoreDatabaseId
+            ? getFirestore(app, fbCfg.firestoreDatabaseId)
+            : getFirestore(app);
+        }
 
-        firestoreContext = { app, db, fs: BUNDLED_FS_MOD };
+        const fsApi = {
+          getFirestore,
+          initializeFirestore,
+          collection,
+          doc,
+          getDoc,
+          getDocFromServer,
+          getDocs,
+          getDocsFromServer: getDocsFromServer || getDocs,
+          setDoc,
+          updateDoc,
+          deleteDoc,
+          query,
+          where,
+          onSnapshot,
+        };
+
+        firestoreContext = { app, db, fs: fsApi };
+        emitSyncStatus({
+          status: 'connected',
+          label: 'Cloud Firestore Live Sync',
+          error: '',
+        });
 
         void getDocFromServer(doc(db, 'test', 'connection')).catch((err) => {
           if (err instanceof Error && err.message.includes('the client is offline')) {
             console.error('Please check your Firebase configuration.');
+            emitSyncStatus({
+              status: 'offline',
+              label: 'Offline (Cached Data)',
+              error: err.message,
+            });
           }
         });
 
@@ -406,6 +567,11 @@ async function getFirestoreContext() {
       } catch (err) {
         console.warn('Firestore SDK init deferred:', err?.message || err);
         firestoreRuntimePromise = null;
+        emitSyncStatus({
+          status: 'reconnecting',
+          label: 'Reconnecting Cloud Sync...',
+          error: err?.message || String(err || ''),
+        });
         return null;
       }
     })();
@@ -818,6 +984,8 @@ async function pullAllFromRtdbIfConfigured() {
 
 const localOtps = new Map();
 const recentlyDeletedUsers = new Map();
+const recentlyUpdatedUtrs = new Map();
+const forceSyncListeners = new Set();
 let activeTargetMobile = '';
 
 // --------------------------------------------
@@ -1386,38 +1554,64 @@ const store = {
     localListeners.add(emitLocal);
     emitLocal();
 
-    const setupRemote = async () => {
-      const [ctx, hasBackend] = await Promise.all([getFirestoreContext(), isExpressBackendAvailable()]);
-      const cfg = getActiveCloudConfig();
-
-      if (!stopped && ctx && u && u !== 'demo') {
-        const docId = toDocId(u);
-        const path = `${COLLECTIONS.users}/${docId}`;
-        unsubFirestore = ctx.fs.onSnapshot(
-          ctx.fs.doc(ctx.db, COLLECTIONS.users, docId),
-          (snap) => {
-            if (stopped) return;
-            if (snap.exists()) {
-              fsUserState = snap.data();
+    const setupFirestore = async () => {
+      const ctx = await getFirestoreContext();
+      if (stopped || !ctx || !u || u === 'demo') return ctx;
+      const docId = toDocId(u);
+      const path = `${COLLECTIONS.users}/${docId}`;
+      const fetchOnce = async () => {
+        try {
+          const snap = await ctx.fs.getDoc(ctx.fs.doc(ctx.db, COLLECTIONS.users, docId));
+          if (!stopped && snap.exists()) {
+            fsUserState = snap.data();
+            mergeAndEmitUser();
+          } else if (!stopped) {
+            const qs = await ctx.fs.getDocs(
+              ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.users), ctx.fs.where('username', '==', u))
+            );
+            if (!stopped && !qs.empty) {
+              fsUserState = qs.docs[0].data();
               mergeAndEmitUser();
-            } else {
-              // Fallback listener by username query if stored under another docId
-              void ctx.fs
-                .getDocs(ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.users), ctx.fs.where('username', '==', u)))
-                .then((qs) => {
-                  if (!stopped && !qs.empty) {
-                    fsUserState = qs.docs[0].data();
-                    mergeAndEmitUser();
-                  }
-                })
-                .catch(() => {});
             }
-          },
-          (error) => {
-            handleFirestoreError(error, OperationType.GET, path);
           }
-        );
-      }
+        } catch {}
+      };
+      void fetchOnce();
+      unsubFirestore = ctx.fs.onSnapshot(
+        ctx.fs.doc(ctx.db, COLLECTIONS.users, docId),
+        (snap) => {
+          if (stopped) return;
+          if (snap.exists()) {
+            fsUserState = snap.data();
+            mergeAndEmitUser();
+          } else {
+            void ctx.fs
+              .getDocs(ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.users), ctx.fs.where('username', '==', u)))
+              .then((qs) => {
+                if (!stopped && !qs.empty) {
+                  fsUserState = qs.docs[0].data();
+                  mergeAndEmitUser();
+                }
+              })
+              .catch(() => {});
+          }
+        },
+        (error) => {
+          handleSnapshotError(error, OperationType.GET, path, () => {
+            if (!stopped && !pollTimer) {
+              pollTimer = setInterval(() => void fetchOnce(), 3500);
+            }
+          });
+        }
+      );
+      return ctx;
+    };
+
+    const setupRemote = async () => {
+      const fsCtxPromise = setupFirestore();
+      const [ctx, hasBackend] = await Promise.all([fsCtxPromise, isExpressBackendAvailable()]);
+      const cfg = getActiveCloudConfig();
+      if (stopped) return;
 
       const fetchExpressProfile = async () => {
         if (stopped || !hasBackend || !u || u === 'demo') return;
@@ -1453,7 +1647,7 @@ const store = {
           }
         };
         void tick();
-        pollTimer = setInterval(() => void tick(), 2000);
+        pollTimer = setInterval(() => void tick(), 2500);
       }
     };
 
@@ -1514,24 +1708,43 @@ const store = {
     localListeners.add(emitLocal);
     emitLocal();
 
-    const setupRemote = async () => {
-      const [ctx, hasBackend] = await Promise.all([getFirestoreContext(), isExpressBackendAvailable()]);
-      const cfg = getActiveCloudConfig();
-
-      if (!stopped && ctx && u && u !== 'demo') {
-        const q = ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.utrs), ctx.fs.where('username', '==', u));
-        unsubFirestore = ctx.fs.onSnapshot(
-          q,
-          (qs) => {
-            if (stopped) return;
+    const setupFirestore = async () => {
+      const ctx = await getFirestoreContext();
+      if (stopped || !ctx || !u || u === 'demo') return ctx;
+      const q = ctx.fs.query(ctx.fs.collection(ctx.db, COLLECTIONS.utrs), ctx.fs.where('username', '==', u));
+      const fetchOnce = async () => {
+        try {
+          const qs = await ctx.fs.getDocs(q);
+          if (!stopped) {
             fsUtrs = qs.docs.map((d) => d.data()).filter(Boolean);
             mergeAndEmitUtrs();
-          },
-          (error) => {
-            handleFirestoreError(error, OperationType.LIST, COLLECTIONS.utrs);
           }
-        );
-      }
+        } catch {}
+      };
+      void fetchOnce();
+      unsubFirestore = ctx.fs.onSnapshot(
+        q,
+        (qs) => {
+          if (stopped) return;
+          fsUtrs = qs.docs.map((d) => d.data()).filter(Boolean);
+          mergeAndEmitUtrs();
+        },
+        (error) => {
+          handleSnapshotError(error, OperationType.LIST, COLLECTIONS.utrs, () => {
+            if (!stopped && !pollTimer) {
+              pollTimer = setInterval(() => void fetchOnce(), 3500);
+            }
+          });
+        }
+      );
+      return ctx;
+    };
+
+    const setupRemote = async () => {
+      const fsCtxPromise = setupFirestore();
+      const [ctx, hasBackend] = await Promise.all([fsCtxPromise, isExpressBackendAvailable()]);
+      const cfg = getActiveCloudConfig();
+      if (stopped) return;
 
       const fetchExpressUtrs = async () => {
         if (stopped || !hasBackend || !u || u === 'demo') return;
@@ -2007,34 +2220,48 @@ const store = {
     return entry;
   },
 
+  subscribeSyncStatus(cb) {
+    if (typeof cb !== 'function') return () => {};
+    syncStatusListeners.add(cb);
+    try {
+      cb({ ...syncStatusState });
+    } catch {}
+    return () => {
+      syncStatusListeners.delete(cb);
+    };
+  },
+
+  getSyncStatus() {
+    return { ...syncStatusState };
+  },
+
   async authenticateAdmin(id, password) {
     const cleanId = String(id || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim().toUpperCase();
     const cleanPass = String(password || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
 
-    if (await isExpressBackendAvailable()) {
-      const res = await apiJson('/api/admin/login', {
-        method: 'POST',
-        body: JSON.stringify({ id: cleanId, password: cleanPass }),
-      });
-      if (res.ok && res.data?.success) {
-        return {
-          success: true,
-          token: res.data.token,
-          adminId: res.data.adminId || cleanId,
-          mode: 'express',
-        };
-      }
-      if (res.status === 401) {
-        return { success: false, message: res.data?.message || 'Access Denied: Invalid Admin ID or Password!' };
-      }
-    }
-
+    // Instant zero-dependency admin credential verification (never blocks on AI Studio server)
     if (cleanId === 'PANNELMANAGER@9405' && (cleanPass === 'PANNEL@9405' || cleanPass.toUpperCase() === 'PANNEL@9405')) {
+      let token = `standalone-admin-${Date.now()}`;
+      let mode = 'standalone';
+
+      // Opportunistically exchange for an Express session token only if Express is already live
+      if (backendAvailable === true) {
+        const res = await apiJson('/api/admin/login', {
+          method: 'POST',
+          timeoutMs: 1200,
+          body: JSON.stringify({ id: cleanId, password: cleanPass }),
+        });
+        if (res.ok && res.data?.success && res.data.token) {
+          token = res.data.token;
+          mode = 'express';
+        }
+      }
+
       return {
         success: true,
-        token: `standalone-admin-${Date.now()}`,
+        token,
         adminId: cleanId,
-        mode: 'standalone',
+        mode,
       };
     }
 
@@ -2044,8 +2271,14 @@ const store = {
   subscribeAdminDashboard(cb) {
     let stopped = false;
     let pollTimer = null;
+    let retryFsTimer = null;
     let sseHandler = null;
-    const unsubs = [];
+    let onlineHandler = null;
+    let visibilityHandler = null;
+    let unsubs = [];
+    let fsDegraded = false;
+    let fsAttached = false;
+    let reconnectAttempt = 0;
 
     const fsState = {
       usersMap: null,
@@ -2070,6 +2303,16 @@ const store = {
     const sortByTimeDesc = (arr) =>
       arr.sort((a, b) => new Date(b?.timestamp || 0).getTime() - new Date(a?.timestamp || 0).getTime());
 
+    const clearFsUnsubs = () => {
+      unsubs.forEach((uFn) => {
+        try {
+          if (typeof uFn === 'function') uFn();
+        } catch {}
+      });
+      unsubs = [];
+      fsAttached = false;
+    };
+
     const mergeAndEmit = () => {
       if (stopped) return;
       const nowMs = Date.now();
@@ -2081,12 +2324,18 @@ const store = {
         return Boolean(exp && exp > nowMs);
       };
 
+      const fsHasUsersSnapshot = fsState.usersMap !== null;
       const mergedUsers = {};
+
+      // Use local cache for initial render or offline fallback; when Firestore has returned a live snapshot,
+      // exclude stale cached users that were deleted remotely unless very recently active in this session.
       Object.entries(getLocalUsersMap()).forEach(([uname, uObj]) => {
-        if (uObj && uname !== 'demo' && !isRecentlyDeleted(uname)) {
+        if (!uObj || uname === 'demo' || isRecentlyDeleted(uname)) return;
+        if (!fsHasUsersSnapshot || (fsState.usersMap && fsState.usersMap[uname])) {
           mergedUsers[uname] = uObj;
         }
       });
+
       const applyUsersMap = (uMap) => {
         if (!uMap || typeof uMap !== 'object') return;
         Object.entries(uMap).forEach(([uname, uObj]) => {
@@ -2150,14 +2399,29 @@ const store = {
         return sortByTimeDesc(Array.from(byId.values()));
       };
 
-      const utrs = mergeById([getLocalUtrs(), expressState.utrs, fsState.utrs], true);
-      const activityLogs = mergeById([getLocalActivityLogs(), expressState.activityLogs, fsState.activityLogs], false);
-      const smsLogs = mergeById([getLocalSmsLogs(), expressState.smsLogs, fsState.smsLogs], false);
+      const fsHasLogsSnapshot = fsState.activityLogs !== null;
+      const fsHasUtrsSnapshot = fsState.utrs !== null;
+      const fsHasSmsSnapshot = fsState.smsLogs !== null;
+
+      const utrs = mergeById([fsHasUtrsSnapshot ? [] : getLocalUtrs(), expressState.utrs, fsState.utrs], true)
+        .filter((w) => w && !isRecentlyDeleted(w.username))
+        .map((w) => {
+          const rec = recentlyUpdatedUtrs.get(w.id);
+          if (rec && rec.exp > nowMs && statusScore(rec.status) > statusScore(w.status)) {
+            return { ...w, status: rec.status };
+          }
+          return w;
+        });
+      const activityLogs = mergeById(
+        [fsHasLogsSnapshot ? [] : getLocalActivityLogs(), expressState.activityLogs, fsState.activityLogs],
+        false
+      );
+      const smsLogs = mergeById([fsHasSmsSnapshot ? [] : getLocalSmsLogs(), expressState.smsLogs, fsState.smsLogs], false);
 
       saveLocalUsersMap(mergedUsers);
-      if (utrs.length > 0) saveLocalUtrs(utrs);
-      if (activityLogs.length > 0) saveLocalActivityLogs(activityLogs);
-      if (smsLogs.length > 0) saveLocalSmsLogs(smsLogs);
+      saveLocalUtrs(utrs);
+      saveLocalActivityLogs(activityLogs);
+      saveLocalSmsLogs(smsLogs);
 
       cb({
         usersMap: mergedUsers,
@@ -2175,69 +2439,181 @@ const store = {
     localListeners.add(emitLocal);
     emitLocal();
 
-    const setupRemote = async () => {
-      const [ctx, hasBackend] = await Promise.all([getFirestoreContext(), isExpressBackendAvailable()]);
-      const cfg = getActiveCloudConfig();
+    const pullFirestoreCollections = async (ctx, fromServer = false) => {
+      if (stopped || !ctx) return false;
+      const readDocs = fromServer && typeof ctx.fs.getDocsFromServer === 'function' ? ctx.fs.getDocsFromServer : ctx.fs.getDocs;
+      try {
+        const [uRes, utrRes, actRes, smsRes] = await Promise.allSettled([
+          readDocs(ctx.fs.collection(ctx.db, COLLECTIONS.users)),
+          readDocs(ctx.fs.collection(ctx.db, COLLECTIONS.utrs)),
+          readDocs(ctx.fs.collection(ctx.db, COLLECTIONS.activityLogs)),
+          readDocs(ctx.fs.collection(ctx.db, COLLECTIONS.smsLogs)),
+        ]);
+        if (stopped) return false;
 
-      if (!stopped && ctx) {
-        unsubs.push(
-          ctx.fs.onSnapshot(
-            ctx.fs.collection(ctx.db, COLLECTIONS.users),
-            (qs) => {
-              if (stopped) return;
-              const nextMap = {};
-              qs.forEach((docSnap) => {
-                const u = docSnap.data();
-                if (u && u.username && u.username !== 'demo') {
-                  nextMap[u.username] = u;
-                }
-              });
-              fsState.usersMap = nextMap;
-              mergeAndEmit();
-            },
-            (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.users)
-          )
-        );
+        let anyOk = false;
+        if (uRes.status === 'fulfilled') {
+          anyOk = true;
+          const nextMap = {};
+          uRes.value.forEach((docSnap) => {
+            const u = docSnap.data();
+            if (u && u.username && u.username !== 'demo') {
+              nextMap[u.username] = u;
+            }
+          });
+          fsState.usersMap = nextMap;
+        }
+        if (utrRes.status === 'fulfilled') {
+          anyOk = true;
+          fsState.utrs = sortByTimeDesc(utrRes.value.docs.map((d) => d.data()).filter(Boolean));
+        }
+        if (actRes.status === 'fulfilled') {
+          anyOk = true;
+          fsState.activityLogs = sortByTimeDesc(actRes.value.docs.map((d) => d.data()).filter(Boolean));
+        }
+        if (smsRes.status === 'fulfilled') {
+          anyOk = true;
+          fsState.smsLogs = sortByTimeDesc(smsRes.value.docs.map((d) => d.data()).filter(Boolean));
+        }
 
-        unsubs.push(
-          ctx.fs.onSnapshot(
-            ctx.fs.collection(ctx.db, COLLECTIONS.utrs),
-            (qs) => {
-              if (stopped) return;
-              fsState.utrs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
-              mergeAndEmit();
-            },
-            (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.utrs)
-          )
-        );
-
-        unsubs.push(
-          ctx.fs.onSnapshot(
-            ctx.fs.collection(ctx.db, COLLECTIONS.activityLogs),
-            (qs) => {
-              if (stopped) return;
-              fsState.activityLogs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
-              mergeAndEmit();
-            },
-            (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.activityLogs)
-          )
-        );
-
-        unsubs.push(
-          ctx.fs.onSnapshot(
-            ctx.fs.collection(ctx.db, COLLECTIONS.smsLogs),
-            (qs) => {
-              if (stopped) return;
-              fsState.smsLogs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
-              mergeAndEmit();
-            },
-            (error) => handleFirestoreError(error, OperationType.LIST, COLLECTIONS.smsLogs)
-          )
-        );
+        if (anyOk) {
+          emitSyncStatus({
+            status: 'connected',
+            label: 'Cloud Firestore Live Sync',
+            lastSyncAt: Date.now(),
+            error: '',
+          });
+          mergeAndEmit();
+        }
+        return anyOk;
+      } catch (err) {
+        emitSyncStatus({
+          status: 'reconnecting',
+          label: 'Reconnecting Cloud Sync...',
+          error: err?.message || String(err || ''),
+        });
+        return false;
       }
+    };
+
+    const scheduleFirestoreReconnect = () => {
+      if (stopped || retryFsTimer) return;
+      const delay = Math.min(10000, 2500 * Math.pow(1.5, reconnectAttempt));
+      reconnectAttempt += 1;
+      retryFsTimer = setTimeout(() => {
+        retryFsTimer = null;
+        if (!stopped) void setupFirestore(true);
+      }, delay);
+    };
+
+    const setupFirestore = async (forceReattach = false) => {
+      const cfg = getActiveCloudConfig();
+      if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+        emitSyncStatus({ status: 'rtdb', label: 'Firebase RTDB Cross-Device Sync', error: '' });
+        return null;
+      }
+      const ctx = await getFirestoreContext();
+      if (stopped) return null;
+      if (!ctx) {
+        scheduleFirestoreReconnect();
+        return null;
+      }
+      if (fsAttached && !forceReattach) return ctx;
+
+      clearFsUnsubs();
+      fsAttached = true;
+
+      // Eager hydration via getDocs so dashboard populates immediately (<1s) even before WebChannel finishes
+      void pullFirestoreCollections(ctx, false);
+
+      const onStreamSuccess = () => {
+        fsDegraded = false;
+        reconnectAttempt = 0;
+        emitSyncStatus({
+          status: 'connected',
+          label: 'Cloud Firestore Live Sync',
+          lastSyncAt: Date.now(),
+          error: '',
+        });
+      };
+
+      const onStreamError = () => {
+        fsDegraded = true;
+        clearFsUnsubs();
+        void pullFirestoreCollections(ctx, false);
+        scheduleFirestoreReconnect();
+      };
+
+      unsubs.push(
+        ctx.fs.onSnapshot(
+          ctx.fs.collection(ctx.db, COLLECTIONS.users),
+          (qs) => {
+            if (stopped) return;
+            const nextMap = {};
+            qs.forEach((docSnap) => {
+              const u = docSnap.data();
+              if (u && u.username && u.username !== 'demo') {
+                nextMap[u.username] = u;
+              }
+            });
+            fsState.usersMap = nextMap;
+            onStreamSuccess();
+            mergeAndEmit();
+          },
+          (error) => handleSnapshotError(error, OperationType.LIST, COLLECTIONS.users, onStreamError)
+        )
+      );
+
+      unsubs.push(
+        ctx.fs.onSnapshot(
+          ctx.fs.collection(ctx.db, COLLECTIONS.utrs),
+          (qs) => {
+            if (stopped) return;
+            fsState.utrs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
+            onStreamSuccess();
+            mergeAndEmit();
+          },
+          (error) => handleSnapshotError(error, OperationType.LIST, COLLECTIONS.utrs, onStreamError)
+        )
+      );
+
+      unsubs.push(
+        ctx.fs.onSnapshot(
+          ctx.fs.collection(ctx.db, COLLECTIONS.activityLogs),
+          (qs) => {
+            if (stopped) return;
+            fsState.activityLogs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
+            onStreamSuccess();
+            mergeAndEmit();
+          },
+          (error) => handleSnapshotError(error, OperationType.LIST, COLLECTIONS.activityLogs, onStreamError)
+        )
+      );
+
+      unsubs.push(
+        ctx.fs.onSnapshot(
+          ctx.fs.collection(ctx.db, COLLECTIONS.smsLogs),
+          (qs) => {
+            if (stopped) return;
+            fsState.smsLogs = sortByTimeDesc(qs.docs.map((d) => d.data()).filter(Boolean));
+            onStreamSuccess();
+            mergeAndEmit();
+          },
+          (error) => handleSnapshotError(error, OperationType.LIST, COLLECTIONS.smsLogs, onStreamError)
+        )
+      );
+
+      return ctx;
+    };
+
+    const setupRemote = async () => {
+      const fsCtxPromise = setupFirestore(false);
+      const [ctx, hasBackend] = await Promise.all([fsCtxPromise, isExpressBackendAvailable()]);
+      const cfg = getActiveCloudConfig();
+      if (stopped) return;
 
       const fetchExpressDashboard = async () => {
-        if (stopped || !hasBackend) return;
+        if (stopped || backendAvailable !== true) return;
         const token = getStoredAdminToken();
         if (!token) return;
         const res = await apiJson('/api/admin/dashboard-data', {
@@ -2261,40 +2637,169 @@ const store = {
         sseListeners.add(sseHandler);
       }
 
-      if (hasBackend || (cfg.mode === 'rtdb' && cfg.rtdbUrl)) {
-        const tick = async () => {
-          if (stopped) return;
-          if (hasBackend) {
-            await fetchExpressDashboard();
-          } else if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
-            const remote = await pullAllFromRtdbIfConfigured();
-            if (!stopped && remote) {
-              expressState.usersMap = remote.usersMap || {};
-              expressState.utrs = remote.utrs || [];
-              expressState.activityLogs = remote.activityLogs || [];
-              expressState.smsLogs = remote.smsLogs || [];
-              mergeAndEmit();
+      const tick = async () => {
+        if (stopped) return;
+        const activeCfg = getActiveCloudConfig();
+        if (activeCfg.mode === 'rtdb' && activeCfg.rtdbUrl) {
+          const remote = await pullAllFromRtdbIfConfigured();
+          if (!stopped && remote) {
+            expressState.usersMap = remote.usersMap || {};
+            expressState.utrs = remote.utrs || [];
+            expressState.activityLogs = remote.activityLogs || [];
+            expressState.smsLogs = remote.smsLogs || [];
+            emitSyncStatus({ status: 'rtdb', label: 'Firebase RTDB Cross-Device Sync', lastSyncAt: Date.now(), error: '' });
+            mergeAndEmit();
+          }
+          return;
+        }
+        if (backendAvailable === true) {
+          await fetchExpressDashboard();
+        }
+        if (activeCfg.mode === 'firestore' && (fsDegraded || !fsAttached || (typeof document === 'undefined' || !document.hidden))) {
+          const liveCtx = firestoreContext || (await getFirestoreContext());
+          if (liveCtx) {
+            if (!fsAttached) {
+              void setupFirestore(true);
+            } else if (fsDegraded) {
+              await pullFirestoreCollections(liveCtx, false);
             }
           }
-        };
+        }
+      };
+
+      if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
         void tick();
-        pollTimer = setInterval(() => void tick(), ctx ? 4500 : 1800);
+      }
+      pollTimer = setInterval(() => void tick(), ctx && !fsDegraded ? 10000 : 3500);
+
+      if (typeof window !== 'undefined') {
+        onlineHandler = () => {
+          if (stopped) return;
+          reconnectAttempt = 0;
+          void setupFirestore(true);
+          void tick();
+        };
+        window.addEventListener('online', onlineHandler);
+      }
+      if (typeof document !== 'undefined') {
+        visibilityHandler = () => {
+          if (!stopped && !document.hidden) {
+            void tick();
+          }
+        };
+        document.addEventListener('visibilitychange', visibilityHandler);
       }
     };
+
+    const applyForcedData = (data) => {
+      if (stopped || !data) return;
+      if (data.usersMap) fsState.usersMap = data.usersMap;
+      if (data.utrs) fsState.utrs = data.utrs;
+      if (data.activityLogs) fsState.activityLogs = data.activityLogs;
+      if (data.smsLogs) fsState.smsLogs = data.smsLogs;
+      mergeAndEmit();
+    };
+    forceSyncListeners.add(applyForcedData);
 
     void setupRemote();
 
     return () => {
       stopped = true;
       localListeners.delete(emitLocal);
+      forceSyncListeners.delete(applyForcedData);
       if (sseHandler) sseListeners.delete(sseHandler);
-      unsubs.forEach((uFn) => {
+      if (onlineHandler && typeof window !== 'undefined') window.removeEventListener('online', onlineHandler);
+      if (visibilityHandler && typeof document !== 'undefined') document.removeEventListener('visibilitychange', visibilityHandler);
+      clearFsUnsubs();
+      if (pollTimer) clearInterval(pollTimer);
+      if (retryFsTimer) clearTimeout(retryFsTimer);
+    };
+  },
+
+  async forceSyncAdminDashboard() {
+    const cfg = getActiveCloudConfig();
+    if (cfg.mode === 'rtdb' && cfg.rtdbUrl) {
+      const remote = await pullAllFromRtdbIfConfigured();
+      if (remote) {
+        emitSyncStatus({ status: 'rtdb', label: 'Firebase RTDB Cross-Device Sync', lastSyncAt: Date.now(), error: '' });
+        forceSyncListeners.forEach((fn) => {
+          try {
+            fn({
+              usersMap: remote.usersMap || {},
+              utrs: remote.utrs || [],
+              activityLogs: remote.activityLogs || [],
+              smsLogs: remote.smsLogs || [],
+            });
+          } catch {}
+        });
+        broadcastSyncEvent('force_sync_rtdb');
+        return {
+          ok: true,
+          mode: 'rtdb',
+          usersCount: Object.keys(remote.usersMap || {}).length,
+          utrsCount: (remote.utrs || []).length,
+        };
+      }
+      return { ok: false, mode: 'rtdb', usersCount: 0, utrsCount: 0 };
+    }
+
+    const ctx = await getFirestoreContext();
+    if (!ctx) {
+      emitSyncStatus({ status: 'offline', label: 'Offline (Local Browser Cache)', error: 'Firestore unreachable' });
+      return {
+        ok: false,
+        mode: 'local',
+        usersCount: Object.keys(getLocalUsersMap()).length,
+        utrsCount: getLocalUtrs().length,
+      };
+    }
+
+    const readServer = typeof ctx.fs.getDocsFromServer === 'function' ? ctx.fs.getDocsFromServer : ctx.fs.getDocs;
+    try {
+      const [uSnap, utrSnap, actSnap, smsSnap] = await Promise.all([
+        readServer(ctx.fs.collection(ctx.db, COLLECTIONS.users)),
+        readServer(ctx.fs.collection(ctx.db, COLLECTIONS.utrs)),
+        readServer(ctx.fs.collection(ctx.db, COLLECTIONS.activityLogs)),
+        readServer(ctx.fs.collection(ctx.db, COLLECTIONS.smsLogs)),
+      ]);
+      const usersMap = {};
+      uSnap.forEach((d) => {
+        const u = d.data();
+        if (u && u.username && u.username !== 'demo') usersMap[u.username] = u;
+      });
+      const sortByTs = (arr) => arr.sort((a, b) => new Date(b?.timestamp || 0).getTime() - new Date(a?.timestamp || 0).getTime());
+      const utrs = sortByTs(utrSnap.docs.map((d) => d.data()).filter(Boolean));
+      const activityLogs = sortByTs(actSnap.docs.map((d) => d.data()).filter(Boolean));
+      const smsLogs = sortByTs(smsSnap.docs.map((d) => d.data()).filter(Boolean));
+
+      saveLocalUsersMap(usersMap);
+      saveLocalUtrs(utrs);
+      saveLocalActivityLogs(activityLogs);
+      saveLocalSmsLogs(smsLogs);
+      emitSyncStatus({ status: 'connected', label: 'Cloud Firestore Live Sync', lastSyncAt: Date.now(), error: '' });
+      const payload = { usersMap, utrs, activityLogs, smsLogs };
+      forceSyncListeners.forEach((fn) => {
         try {
-          if (typeof uFn === 'function') uFn();
+          fn(payload);
         } catch {}
       });
-      if (pollTimer) clearInterval(pollTimer);
-    };
+      broadcastSyncEvent('force_sync_firestore');
+      return {
+        ok: true,
+        mode: 'firestore',
+        usersCount: Object.keys(usersMap).length,
+        utrsCount: utrs.length,
+        data: payload,
+      };
+    } catch (err) {
+      emitSyncStatus({ status: 'reconnecting', label: 'Reconnecting Cloud Sync...', error: err?.message || String(err || '') });
+      return {
+        ok: false,
+        mode: 'local',
+        usersCount: Object.keys(getLocalUsersMap()).length,
+        utrsCount: getLocalUtrs().length,
+      };
+    }
   },
 
   async adminApproveUtr(utrId, uname, itemHint = null) {
@@ -2320,6 +2825,7 @@ const store = {
 
     if (item) {
       item.status = nextStatus;
+      recentlyUpdatedUtrs.set(item.id || utrId, { status: nextStatus, exp: Date.now() + 8000 });
       const idx = utrs.findIndex((u) => u && (u.id === item.id || u.id === utrId));
       if (idx >= 0) utrs[idx] = { ...utrs[idx], status: nextStatus };
       else utrs.unshift({ ...item, status: nextStatus });
@@ -2440,6 +2946,7 @@ const store = {
     const resolvedUname = String(uname || item?.username || '').trim();
     if (item) {
       item.status = nextStatus;
+      recentlyUpdatedUtrs.set(item.id || utrId, { status: nextStatus, exp: Date.now() + 8000 });
       const idx = utrs.findIndex((u) => u && (u.id === item.id || u.id === utrId));
       if (idx >= 0) utrs[idx] = { ...utrs[idx], status: nextStatus };
       else utrs.unshift({ ...item, status: nextStatus });
@@ -2648,6 +3155,12 @@ const store = {
       const docId = toDocId(uname);
       tasks.push(
         fsCtx.fs.deleteDoc(fsCtx.fs.doc(fsCtx.db, COLLECTIONS.users, docId)).catch(() => {})
+      );
+      tasks.push(
+        fsCtx.fs
+          .getDocs(fsCtx.fs.query(fsCtx.fs.collection(fsCtx.db, COLLECTIONS.users), fsCtx.fs.where('username', '==', uname)))
+          .then((uSnap) => Promise.all(uSnap.docs.map((d) => fsCtx.fs.deleteDoc(d.ref))))
+          .catch(() => {})
       );
       tasks.push(
         fsCtx.fs
